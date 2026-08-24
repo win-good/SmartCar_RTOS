@@ -1,62 +1,50 @@
 /**
  ******************************************************************************
  * @file    OLED.c
- * @brief   0.96寸OLED显示屏（SSD1306）程序（4针脚 I2C 接口）
- *          —— F407 / HAL / FreeRTOS 移植版
+ * @brief   0.96寸OLED显示屏驱动程序（4针脚I2C接口）—— F407/HAL/FreeRTOS 移植版
+ * @note    由江协科技原版（STM32F103 标准库 + 软件I2C PB8/PB9）移植而来。
  *
- * @details 由江协科技原版（STM32F103 标准库 + 软件 I2C PB8/PB9）移植而来。
+ *          【移植修改点（相对原版）】
+ *            1. #include "stm32f10x.h" 移除，改用 HAL：经由 i2c.h 使用 hi2c2
+ *            2. 删除软件I2C位操作（OLED_W_SCL / OLED_W_SDA / OLED_GPIO_Init /
+ *               OLED_I2C_Start / Stop / SendByte），改为 HAL_I2C_Master_Transmit
+ *               一次事务发送 [控制字节+数据]，地址 0x78（7bit 0x3C 左移1位）
+ *            3. OLED_Init 中上电稳定延时改用 HAL_Delay(100)；
+ *               GPIO/时钟/复用功能全部由 CubeMX 的 MX_I2C2_Init 完成，此处不再配置
+ *            4. 增加 OLED_I2C_TIMEOUT_MS 超时保护：总线异常时函数直接返回，
+ *               避免 FreeRTOS 任务被 HAL 超时前的轮询长时间阻塞
+ *          【保持不变】显存模型 OLED_DisplayBuf、全部显示/绘图/字模引用逻辑，
+ *          上层 API 用法与原版完全一致。
  *
- * 【相对原版的所有移植修改点】
- *   1. 移除软件 I2C 位操作（OLED_W_SCL / OLED_W_SDA / GPIO_Init / I2C_Start /
- *      Stop / SendByte），改为 HAL_I2C_Master_Transmit 一次事务发送
- *      [控制字节 + 数据] 的标准 SSD1306 I2C 协议；
- *   2. 设备地址采用 0x78（7bit 0x3C 左移 1 位），与本工程硬件一致；
- *   3. GPIO/复用/时钟全部由 CubeMX 的 MX_I2C2_Init 完成，此处不再配置；
- *   4. 单次事务加入 OLED_I2C_TIMEOUT_MS 超时保护（50ms），避免总线异常
- *      时 HAL 长时间阻塞 FreeRTOS 任务；
- *   5. OLED_WriteCommand / OLED_WriteData 增加"失败重试 3 次"机制，
- *      解决总线偶发 NACK 导致 OLED_Init / OLED_Update 偶发黑屏的问题；
- *   6. OLED_ShowString 加入宽度保护 guard，防止越长字符串的字符被
- *      错误地写到 OLED_DisplayBuf 之外造成错位乱码或内存越界；
- *   7. OLED_ShowString 在字符集宏未定义时，CharLength 兜底按 ASCII 处理
- *      并主动 i++ 推进游标，避免死循环黑屏；
- *   8. 多字节字符未在字模库命中时，画空白而非"框 + ?"，消除乱码。
+ *          【引脚与配置（对齐本工程 CubeMX）】
+ *            I2C2：PB10=SCL / PB11=SDA，100kHz 标准模式，AF 开漏，外接 4.7k 上拉
  *
- * 【保持不变】显存模型 OLED_DisplayBuf[8][128]、全部显示/绘图/字模引用逻辑，
- *            上层 API 用法与原版完全一致。
+ *          【2026-08-24 传输层重构（修复"黑屏 / 花屏错位 / 复位后无显示"）】
+ *            原 DMA+信号量非阻塞方案整体弃用，改为"轮询 + 失败重试 + 总线自救"：
+ *            1. 所有写命令/写数据统一走 HAL_I2C_Master_Transmit 轮询，
+ *               单事务 50ms 硬超时，失败自动重试 3 次，抗杜邦线偶发干扰；
+ *            2. OLED_Init 前先做 I2C2 总线恢复（GPIO 位拨 9 个 SCL 脉冲，
+ *               逼从机释放被拉低的 SDA），再 DeInit/Init 重置外设状态——
+ *               解决"按键复位不断 OLED 电源 → SDA 残留低电平 → HAL_BUSY →
+ *               初始化序列全丢 → 充电泵不开 → 黑屏，只能断电恢复"的老问题；
+ *            3. 运行期显示任务每帧调用 OLED_I2C_SelfCheck()，探测到外设
+ *               BUSY/ERR 或 SDA 被拉死时，自动恢复总线并重发完整初始化序列，
+ *               花屏/黑屏可在一帧内自愈，不再积累错位乱码；
+ *            4. 轮询仅在总线异常时才阻塞(≤50ms)；正常 100kHz 下一页 129 字节
+ *               约 11ms，全刷 8 页约 90ms，配合 50ms 任务周期约 7~10FPS，
+ *               满足仪表刷新且任何路径都不会让任务永久挂死。
  *
- * 【硬件引脚与 CubeMX 配置（I2C2）】
- *   SCL → PB10 / SDA → PB11，AF 开漏输出，外接 4.7kΩ 上拉电阻；
- *   时钟 50kHz（标准模式，50k 比 100k 对面包板/弱上拉更宽容，可显著
- *         降低位损坏导致的"错位乱码"风险；全刷 8 页 ≈ 180ms 仍远低于
- *         TaskDisplay 的 50ms 周期更新预算外的可接受范围）。
- *
- * 【字符集宏】
- *   #define OLED_CHARSET_UTF8       → UTF8 多字节解析（推荐，本工程使用）
- *   #define OLED_CHARSET_GB2312     → GB2312 双字节解析
- *   两者都不定义时回退为纯 ASCII 单字节模式。
- *
- * 【SH1106 适配】
- *   默认按 SSD1306 驱动。若屏实际为1.3寸 SH1106（132 列，起始列 2），
- *   把 #define OLED_USE_SH1106 改为 1 重新编译即可在 OLED_SetCursor 中
- *   自动 X += 2。
- *
- * 原程序版权归江协科技所有（jiangxiekeji.com），本移植版仅替换通信底层。
+ *          原程序版权归江协科技所有（jiangxiekeji.com），本移植版仅替换通信底层。
  ******************************************************************************
  */
 
 #include "i2c.h"      /* hi2c2：CubeMX 生成的 I2C2 句柄 */
+#include "main.h"     /* GPIO 位操作（总线自救）与 HAL_Delay */
 #include "OLED.h"
 #include <string.h>
 #include <math.h>
 #include <stdio.h>
 #include <stdarg.h>
-
-/* 字符集选择：驱动 OLED_ShowString 用 UTF8/GB2312 区分单字节 ASCII 与多字节中文。
- * 未定义任何字符集宏时 CharLength 恒为 0，OLED_ShowString 会把每个 ASCII 字符
- * 误判为中文、用未初始化内存越界查字模，导致整屏黑屏/乱码。
- * 本工程 TaskDisplay 只显示纯 ASCII，定义为 UTF8 即可（多字节按 UTF8 解析）。 */
-#define OLED_CHARSET_UTF8
 
 /**
   * 数据存储格式：
@@ -90,25 +78,121 @@ uint8_t OLED_DisplayBuf[8][128];
 /* 单次 I2C 事务超时(ms)：总线异常时快速返回，防止任务长时间阻塞 */
 #define OLED_I2C_TIMEOUT_MS     50u
 
-/* 是否为 1.3 寸 SH1106 屏（列起始偏移 2）。
- * 0.96 寸 SSD1306 设为 0；1.3 寸 SH1106 设为 1（OLED_SetCursor 自动 X+=2）。
- * 默认 0，若修完仍错位且内容像整体右偏 2 列，把本宏改为 1 重新编译。 */
-#ifndef OLED_USE_SH1106
-#define OLED_USE_SH1106  0u
-#endif
+/**
+  * 函    数：I2C2 总线自救（SDA 被从机拉死时的标准恢复流程）
+  * 参    数：无
+  * 说    明：背景——按键复位/NRST 复位不会切断 OLED 电源。若复位瞬间 OLED 正处于
+  *           一次传输的"应答位"上，它会把 SDA 一直拉低等待后续时钟，于是 I2C2 外设
+  *           上电后看到 SDA=0，直接进入 BUSY，之后所有发送返回 HAL_BUSY，
+  *           初始化序列一条都进不去（充电泵 0x8D/0x14 没发 → 黑屏），只有整机电源
+  *           断开让 OLED 掉电复位才能恢复——这正是"复位后无显示、断电重上电就好"。
+  *           恢复步骤（SSD1306 手册推荐）：
+  *             1. 暂时把 SCL/SDA 切成普通开漏 GPIO（断开 I2C 外设对引脚的控制）；
+  *             2. 手动拨 9 个 SCL 时钟脉冲，从机在第 9 个脉冲后释放 SDA；
+  *             3. 用 GPIO 手动发一个 STOP（SDA 低→高，期间 SCL 保持高）；
+  *             4. HAL_I2C_DeInit+Init 把引脚切回 AF 并重置 I2C2 外设状态。
+  */
+static void OLED_I2C_BusRecovery(void)
+{
+	GPIO_InitTypeDef gpio = {0};
+	uint8_t i;
+
+	/*SDA(PB11) 先置输出高（开漏：高=释放，靠外部上拉拉起），SCL(PB10) 同样释放*/
+	HAL_GPIO_WritePin(GPIOB, GPIO_PIN_10 | GPIO_PIN_11, GPIO_PIN_SET);
+
+	/*SCL/SDA 切为普通开漏 GPIO，脱离 I2C2 外设*/
+	gpio.Pin   = GPIO_PIN_10 | GPIO_PIN_11;
+	gpio.Mode  = GPIO_MODE_OUTPUT_OD;
+	gpio.Pull  = GPIO_NOPULL;
+	gpio.Speed = GPIO_SPEED_FREQ_LOW;
+	HAL_GPIO_Init(GPIOB, &gpio);
+
+	/*如果 SDA 已经是高，说明总线没被拉死，无需拨脉冲（直接交给 DeInit/Init 重置外设）*/
+	if (HAL_GPIO_ReadPin(GPIOB, GPIO_PIN_11) == GPIO_PIN_RESET)
+	{
+		/*拨 9 个 SCL 脉冲，逼从机走完残余位并释放 SDA*/
+		for (i = 0; i < 9u; i++)
+		{
+			HAL_GPIO_WritePin(GPIOB, GPIO_PIN_10, GPIO_PIN_RESET);	/*SCL 拉低*/
+			for (volatile uint16_t d = 0; d < 100; d++) { __NOP(); }	/*约几微秒*/
+			HAL_GPIO_WritePin(GPIOB, GPIO_PIN_10, GPIO_PIN_SET);	/*SCL 释放*/
+			for (volatile uint16_t d = 0; d < 100; d++) { __NOP(); }
+			/*SDA 一旦释放就提前结束，减少总线扰动*/
+			if (HAL_GPIO_ReadPin(GPIOB, GPIO_PIN_11) == GPIO_PIN_SET) { break; }
+		}
+
+		/*手动 STOP 条件：SCL 为高期间，SDA 由低跳高*/
+		HAL_GPIO_WritePin(GPIOB, GPIO_PIN_11, GPIO_PIN_RESET);	/*SDA 拉低*/
+		for (volatile uint16_t d = 0; d < 100; d++) { __NOP(); }
+		HAL_GPIO_WritePin(GPIOB, GPIO_PIN_10, GPIO_PIN_SET);	/*SCL 保持高*/
+		for (volatile uint16_t d = 0; d < 100; d++) { __NOP(); }
+		HAL_GPIO_WritePin(GPIOB, GPIO_PIN_11, GPIO_PIN_SET);	/*SDA 释放→STOP*/
+		for (volatile uint16_t d = 0; d < 100; d++) { __NOP(); }
+	}
+
+	/*引脚切回 I2C2 复用开漏，并重置外设寄存器（清 BUSY/ERR 等残留状态）*/
+	HAL_I2C_DeInit(&hi2c2);
+	HAL_I2C_Init(&hi2c2);
+}
 
 /**
-  * 函    数：OLED 发送一帧 I2C 数据（HAL 阻塞式轮询，简单可靠）
+  * 函    数：OLED 发送一帧 I2C 数据（轮询 + 失败重试，永不挂死）
   * 参    数：Buf 发送缓冲（含控制字节）；Len 字节数
-  * 说    明：放弃此前 DMA+信号量方案——DMA 依赖 I2C2 EV/ER 中断且一旦总线出错
-  *           状态机不复位，会持续把 TaskDisplay 阻塞在信号量等待上，
-  *           表现为"外接LED/蜂鸣器无反应、系统卡死"。
-  *           改为 HAL_I2C_Master_Transmit 轮询，失败返回 HAL_TIMEOUT 即放弃本帧，
-  *           绝不会永久阻塞，最多拖慢一帧；这是 F407 硬件 I2C 驱动的主流做法。
+  * 说    明：2026-08-24 起统一采用轮询方案（原 DMA+信号量方案已移除，原因见文件头）：
+  *           - 单事务 50ms 硬超时，失败重试 3 次，重试间插入短延时让总线喘息；
+  *           - 连续失败且检测到外设 BUSY/ERR 时，触发一次总线自救后重试；
+  *           - 初始化期与运行期行为完全一致，不存在"两条路径两套毛病"；
+  *           - 正常情况 100kHz 下 2 字节命令约 0.3ms、129 字节一页约 11ms，
+  *             轮询阻塞时间可控，不影响 FreeRTOS 任务调度。
   */
 static void OLED_I2C_Send(uint8_t *Buf, uint16_t Len)
 {
-	HAL_I2C_Master_Transmit(&hi2c2, OLED_I2C_ADDR_8BIT, Buf, Len, OLED_I2C_TIMEOUT_MS);
+	uint8_t t;
+	for (t = 0; t < 3u; t++)
+	{
+		if (HAL_I2C_Master_Transmit(&hi2c2, OLED_I2C_ADDR_8BIT, Buf, Len,
+		                            OLED_I2C_TIMEOUT_MS) == HAL_OK)
+		{
+			return;		/*发送成功，直接返回*/
+		}
+		/*失败：若外设卡在 BUSY/ERR，先做一次总线自救再继续重试*/
+		if ((hi2c2.State == HAL_I2C_STATE_BUSY) ||
+		    (hi2c2.State == HAL_I2C_STATE_BUSY_TX) ||
+		    (hi2c2.ErrorCode != HAL_I2C_ERROR_NONE))
+		{
+			OLED_I2C_BusRecovery();
+		}
+		for (volatile uint16_t d = 0; d < 200; d++) { __NOP(); }	/*重试间隔*/
+	}
+}
+
+/**
+  * 函    数：OLED I2C 链路自检（供显示任务每帧调用，实现运行期自愈）
+  * 参    数：无
+  * 说    明：检测两类故障并自愈：
+  *           1. I2C2 外设状态异常（BUSY/ERR/超时残留）→ 总线自救 + 重发初始化序列；
+  *           2. SDA 被从机拉死（空闲时读到低电平）→ 同上。
+  *           自愈后 OLED 重新走完整初始化+清屏，花屏/错位/黑屏在一帧内恢复。
+  *           正常时本函数只读两个状态，开销可忽略。
+  */
+void OLED_I2C_SelfCheck(void)
+{
+	uint8_t need_reinit = 0u;
+
+	if ((hi2c2.State != HAL_I2C_STATE_READY) && (hi2c2.State != HAL_I2C_STATE_BUSY_TX))
+	{
+		need_reinit = 1u;		/*外设不在就绪态：BUSY/ERROR/TIMEOUT 等*/
+	}
+	if (HAL_GPIO_ReadPin(GPIOB, GPIO_PIN_11) == GPIO_PIN_RESET)
+	{
+		need_reinit = 1u;		/*空闲时 SDA 应为高：被拉低=从机卡死*/
+	}
+
+	if (need_reinit)
+	{
+		OLED_I2C_BusRecovery();	/*恢复总线+重置外设*/
+		OLED_Init();			/*重发完整初始化序列并清屏，屏幕自愈*/
+	}
 }
 
 /**
@@ -117,23 +201,12 @@ static void OLED_I2C_Send(uint8_t *Buf, uint16_t Len)
   * 返 回 值：无
   * 说    明：一次 I2C 事务发送 [控制字节0x00 + 命令]
   */
-/**
-  * 函    数：OLED写一字节命令（含重试）。
-  * 说    明：I2C 总线偶尔受干扰 NACK，一次失败重试 3 次避免 OLED 偶发黑屏。
-  */
 void OLED_WriteCommand(uint8_t Command)
 {
 	uint8_t Buf[2];
-	Buf[0] = 0x00;			/* 控制字节：0x00=命令，0x40=数据 */
+	Buf[0] = 0x00;			//控制字节，0x00 表示后续为命令
 	Buf[1] = Command;
-	for (uint8_t t = 0u; t < 3u; t++) {
-		if (HAL_I2C_Master_Transmit(&hi2c2, OLED_I2C_ADDR_8BIT,
-		                            Buf, 2, OLED_I2C_TIMEOUT_MS) == HAL_OK) {
-			return;
-		}
-		/* 失败时短暂延时再重试，避免总线持续占用 */
-		for (volatile uint16_t d = 0u; d < 200u; d++) { __NOP(); }
-	}
+	OLED_I2C_Send(Buf, 2);
 }
 
 /**
@@ -144,24 +217,17 @@ void OLED_WriteCommand(uint8_t Command)
   * 说    明：一次 I2C 事务发送 [控制字节0x40 + 连续数据]，
   *           比逐字节启停总线效率更高，且符合 SSD1306 连续写规范
   */
-/**
-  * 函    数：OLED写连续数据（含重试，避免单次 NACK 导致残影）
-  */
 void OLED_WriteData(uint8_t *Data, uint8_t Count)
 {
-	uint8_t Buf[129];		/* 1 控制字节 + 最多 128 数据 */
-	Buf[0] = 0x40;			/* 控制字节：0x40 表示后续为数据 */
-	for (uint8_t i = 0u; i < Count; i++) {
-		Buf[i + 1u] = Data[i];
+	uint8_t Buf[129];		//1 控制字节 + 最多 128 数据
+	uint8_t i;
+
+	Buf[0] = 0x40;			//控制字节，0x40 表示后续为数据
+	for (i = 0; i < Count; i ++)
+	{
+		Buf[i + 1] = Data[i];
 	}
-	for (uint8_t t = 0u; t < 3u; t++) {
-		if (HAL_I2C_Master_Transmit(&hi2c2, OLED_I2C_ADDR_8BIT,
-		                            Buf, (uint16_t)(Count + 1u),
-		                            OLED_I2C_TIMEOUT_MS) == HAL_OK) {
-			return;
-		}
-		for (volatile uint16_t d = 0u; d < 200u; d++) { __NOP(); }
-	}
+	OLED_I2C_Send(Buf, (uint16_t)(Count + 1));
 }
 
 /*********************通信协议*/
@@ -184,6 +250,10 @@ void OLED_Init(void)
 {
 	/*在初始化前，加入适量延时，待OLED供电稳定*/
 	HAL_Delay(100);
+
+	/*先做总线自救+外设重置：清除"复位不断OLED电源"遗留的 SDA 拉低 / BUSY 状态，
+	  保证下面的初始化命令序列能真正发进 OLED（否则充电泵不开=黑屏）*/
+	OLED_I2C_BusRecovery();
 
 	/*写入一系列的命令，对OLED进行初始化配置*/
 	OLED_WriteCommand(0xAE);	//设置显示开启/关闭，0xAE关闭，0xAF开启
@@ -237,10 +307,11 @@ void OLED_Init(void)
   */
 void OLED_SetCursor(uint8_t Page, uint8_t X)
 {
-	/* 1.3 寸 SH1106 起始列偏移 2：宏开启时自动 X+=2，否则按 SSD1306 原列 */
-#if (OLED_USE_SH1106 == 1u)
-	X += 2;
-#endif
+	/*如果使用此程序驱动1.3寸的OLED显示屏，则需要解除此注释*/
+	/*因为1.3寸的OLED驱动芯片（SH1106）有132列*/
+	/*屏幕的起始列接在了第2列，而不是第0列*/
+	/*所以需要将X加2，才能正常显示*/
+//	X += 2;
 
 	/*通过指令设置页地址和列地址*/
 	OLED_WriteCommand(0xB0 | Page);					//设置页位置
@@ -489,6 +560,12 @@ void OLED_ReverseArea(int16_t X, int16_t Y, uint8_t Width, uint8_t Height)
   */
 void OLED_ShowChar(int16_t X, int16_t Y, char Char, uint8_t FontSize)
 {
+	/*2026-08-24 边界保护：坐标完全出屏或字符越出ASCII字模表时直接忽略。
+	  防止 snprintf 拼出的异常内容（控制字符、超长串）造成字模数组越界读，
+	  越界读到的脏数据画进显存就是"错位乱码"的典型来源之一。*/
+	if ((Char < ' ') || (Char > '~')) { return; }		/*只接受可见ASCII*/
+	if ((X <= -8) || (X >= 128) || (Y <= -16) || (Y >= 64)) { return; }
+
 	if (FontSize == OLED_8X16)		//字体为宽8像素，高16像素
 	{
 		/*将ASCII字模库OLED_F8x16的指定数据以8*16的图像格式显示*/
@@ -521,14 +598,10 @@ void OLED_ShowString(int16_t X, int16_t Y, char *String, uint8_t FontSize)
 
 	while (String[i] != '\0')	//遍历字符串
 	{
-		/* 屏幕宽度保护：超过右边界(128px)即停止渲染。
-		 * 否则超长串会把 OLED_DisplayBuf 写越界 → 错位乱码、内存损坏。
-		 * 用 FontSize 作为单字符宽度（ASCII 字符宽 6 或 8），只可能提前截断，
-		 * 绝不会越界（OLED_ShowImage 内部还有列边界检查兜底）。 */
-		{
-			uint16_t cw = (FontSize == OLED_8X16) ? 8u : 6u;
-			if ((uint16_t)(X + XOffset + cw) > 128u) { break; }
-		}
+		/*2026-08-24 宽度保护：当前绘制位置已出右边界则停止，
+		  避免超长字符串继续往显存右界外写（配合 ShowChar 的边界检查，
+		  双保险杜绝横向错位/越界）*/
+		if ((X + (int16_t)XOffset) >= 128) { break; }
 
 #ifdef OLED_CHARSET_UTF8						//定义字符集为UTF8
 		/*此段代码的目的是，提取UTF8字符串中的一个字符，转存到SingleChar子字符串中*/
@@ -602,7 +675,7 @@ void OLED_ShowString(int16_t X, int16_t Y, char *String, uint8_t FontSize)
 			OLED_ShowChar(X + XOffset, Y, SingleChar[0], FontSize);
 			XOffset += FontSize;
 		}
-		else if (CharLength >= 2)	//多字节字符（中文）
+		else					//否则，即多字节字符
 		{
 			/*遍历整个字模库，从字模库中寻找此字符的数据*/
 			/*如果找到最后一个字符（定义为空字符串），则表示字符未在字模库定义，停止寻找*/
@@ -614,24 +687,7 @@ void OLED_ShowString(int16_t X, int16_t Y, char *String, uint8_t FontSize)
 					break;		//跳出循环，此时pIndex的值为指定字符的索引
 				}
 			}
-			/* 未在字模库找到（pIndex 指向 "" 结束项）：清空该区域，
-			 * 不再显示垃圾/框，避免"框型+?"乱码 */
-			if (strcmp(OLED_CF16x16[pIndex].Index, "") == 0)
-			{
-				static const uint8_t blank16[32] = {0};
-				static const uint8_t blank8[16]  = {0};
-				if (FontSize == OLED_8X16)
-				{
-					OLED_ShowImage(X + XOffset, Y, 16, 16, blank16);
-					XOffset += 16;
-				}
-				else
-				{
-					OLED_ShowImage(X + XOffset, Y, 8, 8, blank8);
-					XOffset += 8;
-				}
-			}
-			else if (FontSize == OLED_8X16)		//给定字体为8*16点阵
+			if (FontSize == OLED_8X16)		//给定字体为8*16点阵
 			{
 				/*将字模库OLED_CF16x16的指定数据以16*16的图像格式显示*/
 				OLED_ShowImage(X + XOffset, Y, 16, 16, OLED_CF16x16[pIndex].Data);
@@ -643,12 +699,6 @@ void OLED_ShowString(int16_t X, int16_t Y, char *String, uint8_t FontSize)
 				OLED_ShowChar(X + XOffset, Y, '?', OLED_6X8);
 				XOffset += OLED_6X8;
 			}
-		}
-		else					//CharLength==0（未定义字符集宏等异常）：按 ASCII 兜底显示
-		{
-			OLED_ShowChar(X + XOffset, Y, String[i], FontSize);
-			XOffset += FontSize;
-			i ++;				//务必推进游标，否则死循环
 		}
 	}
 }
@@ -800,10 +850,12 @@ void OLED_ShowImage(int16_t X, int16_t Y, uint8_t Width, uint8_t Height, const u
 					OLED_DisplayBuf[Page + j][X + i] |= Image[j * Width + i] << (Shift);
 				}
 
-				if (Page + j + 1 >= 0 && Page + j + 1 <= 7)	//超出屏幕的内容不显示
+				/*2026-08-24：Shift==0 时图像恰好页对齐，下一页无内容；
+				  且 uint8_t 右移 8 位属未定义行为，必须跳过*/
+				if ((Shift != 0) && (Page + j + 1 >= 0) && (Page + j + 1 <= 7))	//超出屏幕的内容不显示
 				{
 					/*显示图像在下一页的内容*/
-					OLED_DisplayBuf[Page + j + 1][X + i] |= Image[j * Width + i] >> (8 - Shift);
+					OLED_DisplayBuf[Page + j + 1][X + i] |= (uint8_t)(Image[j * Width + i] >> (8 - Shift));
 				}
 			}
 		}
@@ -1272,6 +1324,9 @@ void OLED_DrawArc(int16_t X, int16_t Y, uint8_t Radius, int16_t StartAngle, int1
 
 /*********************功能函数*/
 
+
+/* 注：原 HAL_I2C_MasterTxCpltCallback（DMA 完成回调）随 DMA 方案一并移除。
+ * I2C2 现在不配置任何中断与 DMA，NVIC 中 I2C2_EV/ER 是否使能均不影响轮询工作。 */
 
 /*****************江协科技|版权所有****************/
 /*****************jiangxiekeji.com*****************/

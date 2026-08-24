@@ -35,6 +35,12 @@
 /*初始化函数*/
 void OLED_Init(void);
 
+/*I2C 链路自检（2026-08-24 新增）：显示任务每帧调用一次。
+  检测到 I2C2 外设 BUSY/ERR 或 SDA 被从机拉死时，自动做总线恢复
+  （9 个 SCL 脉冲 + 手动 STOP + DeInit/Init）并重发完整初始化序列，
+  花屏/黑屏在一帧内自愈。正常时仅两次状态读取，开销可忽略。*/
+void OLED_I2C_SelfCheck(void);
+
 /*更新函数*/
 void OLED_Update(void);
 void OLED_UpdateArea(int16_t X, int16_t Y, uint8_t Width, uint8_t Height);

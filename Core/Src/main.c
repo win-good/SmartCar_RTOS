@@ -28,6 +28,7 @@
 
 /* Private includes ----------------------------------------------------------*/
 /* USER CODE BEGIN Includes */
+#include "app_rtos.h"   /* 2026-08-24：App_Watchdog_Init/Feed（独立看门狗） */
 
 /* USER CODE END Includes */
 
@@ -81,6 +82,12 @@ int main(void)
   HAL_Init();
 
   /* USER CODE BEGIN Init */
+  /* 2026-08-24：尽早启用独立看门狗（IWDG，LSI 独立时钟，不依赖系统时钟配置）。
+   * 超时 20s（见 app_rtos.c App_Watchdog_Init 的说明）：必须能覆盖整个初始化阶段，
+   * 否则 OLED_Init 等耗时初始化在调度器启动前就可能触发复位造成"反复复位卡死"。
+   * 任何阶段死机/死循环（含初始化失败进 Error_Handler）都会由看门狗自动复位恢复；
+   * 正常运行由 TaskDisplay 每 50ms 喂狗一次，20s 裕量绝不误触发。 */
+  App_Watchdog_Init();
 
   /* USER CODE END Init */
 
@@ -176,7 +183,10 @@ void SystemClock_Config(void)
 
   /** Enables the Clock Security System
   */
-  HAL_RCC_EnableCSS();
+  /* 2026-08-24：移除 HAL_RCC_EnableCSS()。
+   * 原因：CSS 在 HSE 受干扰停振时会触发 NMI，而原 NMI_Handler 处理完是死循环，
+   * 表现为"运行中突然整机冻结、只能断电恢复"。面包板长线环境下 HSE 偶发
+   * 抖动概率不可忽略，本设计不需要运行中热切时钟，故关闭 CSS 从根上消除此隐患。 */
 }
 
 /* USER CODE BEGIN 4 */
@@ -212,7 +222,8 @@ void Error_Handler(void)
 {
   /* USER CODE BEGIN Error_Handler_Debug */
   /* User can add his own implementation to report the HAL error return state */
-  __disable_irq();
+  /* 2026-08-24：不再 __disable_irq()+死循环（那样只能断电恢复）。
+   * 保持中断开启原地等待，由独立看门狗(约2.7s)自动复位整机恢复。 */
   while (1)
   {
   }

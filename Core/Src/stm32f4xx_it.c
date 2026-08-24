@@ -83,7 +83,7 @@ void NMI_Handler(void)
   /* USER CODE END NonMaskableInt_IRQn 0 */
   HAL_RCC_NMI_IRQHandler();
   /* USER CODE BEGIN NonMaskableInt_IRQn 1 */
-   while (1)
+   NVIC_SystemReset();  /* 2026-08-24：故障/NMI 不再死循环等断电，直接整机复位自愈；原循环留作复位延时兜底 */ while (1)
   {
   }
   /* USER CODE END NonMaskableInt_IRQn 1 */
@@ -97,7 +97,7 @@ void HardFault_Handler(void)
   /* USER CODE BEGIN HardFault_IRQn 0 */
 
   /* USER CODE END HardFault_IRQn 0 */
-  while (1)
+  NVIC_SystemReset();  /* 2026-08-24：故障/NMI 不再死循环等断电，直接整机复位自愈；原循环留作复位延时兜底 */ while (1)
   {
     /* USER CODE BEGIN W1_HardFault_IRQn 0 */
     /* USER CODE END W1_HardFault_IRQn 0 */
@@ -112,7 +112,7 @@ void MemManage_Handler(void)
   /* USER CODE BEGIN MemoryManagement_IRQn 0 */
 
   /* USER CODE END MemoryManagement_IRQn 0 */
-  while (1)
+  NVIC_SystemReset();  /* 2026-08-24：故障/NMI 不再死循环等断电，直接整机复位自愈；原循环留作复位延时兜底 */ while (1)
   {
     /* USER CODE BEGIN W1_MemoryManagement_IRQn 0 */
     /* USER CODE END W1_MemoryManagement_IRQn 0 */
@@ -127,7 +127,7 @@ void BusFault_Handler(void)
   /* USER CODE BEGIN BusFault_IRQn 0 */
 
   /* USER CODE END BusFault_IRQn 0 */
-  while (1)
+  NVIC_SystemReset();  /* 2026-08-24：故障/NMI 不再死循环等断电，直接整机复位自愈；原循环留作复位延时兜底 */ while (1)
   {
     /* USER CODE BEGIN W1_BusFault_IRQn 0 */
     /* USER CODE END W1_BusFault_IRQn 0 */
@@ -142,7 +142,7 @@ void UsageFault_Handler(void)
   /* USER CODE BEGIN UsageFault_IRQn 0 */
 
   /* USER CODE END UsageFault_IRQn 0 */
-  while (1)
+  NVIC_SystemReset();  /* 2026-08-24：故障/NMI 不再死循环等断电，直接整机复位自愈；原循环留作复位延时兜底 */ while (1)
   {
     /* USER CODE BEGIN W1_UsageFault_IRQn 0 */
     /* USER CODE END W1_UsageFault_IRQn 0 */

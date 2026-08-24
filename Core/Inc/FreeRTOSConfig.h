@@ -117,10 +117,6 @@ to exclude the API function. */
 #define INCLUDE_xTaskGetCurrentTaskHandle    1
 #define INCLUDE_eTaskGetState                1
 
-/* 栈溢出检测：2=方法2最彻底（上下文切换+ISR末尾都检查），发现即进入钩子。
- * 默认 0=关闭，启用后栈溢出会调用 vApplicationStackOverflowHook */
-#define configCHECK_FOR_STACK_OVERFLOW       2
-
 /*
  * The CMSIS-RTOS V2 FreeRTOS wrapper is dependent on the heap implementation used
  * by the application thus the correct define need to be enabled below

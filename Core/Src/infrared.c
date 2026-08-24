@@ -20,18 +20,3 @@ uint8_t Infrared_Read(Infrared_Index_t idx)
   }
   return (uint8_t)HAL_GPIO_ReadPin(HW01Y_GPIO_Port, HW01Y_Pin);
 }
-
-/**
- * @brief  判定指定红外是否检测到障碍（按 IR_ACTIVE_LEVEL 做极性归一化）
- * @note   返回值语义始终为"是否检测到障碍"，与原始电平解耦，
- *         决策层/传感任务直接用它，避免因模块极性不同而误判等级。
- */
-uint8_t Infrared_Detected(Infrared_Index_t idx)
-{
-  uint8_t lvl = Infrared_Read(idx);   /* 1=高 0=低 */
-  if (IR_ACTIVE_LEVEL == 1u)
-  {
-    return lvl;                       /* 遇障碍=高电平 */
-  }
-  return (uint8_t)(lvl == 0u);        /* 遇障碍=低电平 */
-}

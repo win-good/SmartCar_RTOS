@@ -55,10 +55,9 @@ extern "C" {
 #define LED_R_GPIO_Port   LED1_GPIO_Port
 
 /* ============================ 常量定义 ============================ */
-#define MODE_IDLE        0u   /* 默认/停止：电机不动，仅传感器预警（不自主移动）   */
-#define MODE_NORMAL      1u   /* 模式1：普通避障（红外+超声波，无视觉）            */
-#define MODE_FUSION      2u   /* 模式2：高级智能融合避障（K230视觉+雷达+姿态）      */
-#define MODE_BLUETOOTH   3u   /* 模式3：蓝牙遥控（人控+机警，危险工况自动预警）     */
+#define MODE_NORMAL      1u   /* 模式1：普通避障（红外+超声波，无视觉）          */
+#define MODE_FUSION      2u   /* 模式2：高级智能融合避障（K230视觉+雷达+姿态）    */
+#define MODE_BLUETOOTH   3u   /* 模式3：蓝牙遥控（人控+机警，危险工况自动预警）   */
 
 /* 四级预警语义（2026-08-23 重构）：数值越大等级越高，显示互斥只显最高级 */
 #define ALERT_NONE       0u   /* 无预警                                          */
@@ -77,10 +76,8 @@ typedef struct {
     uint16_t dist_left_cm;
     uint16_t dist_right_cm;
     uint16_t dist_back_cm;
-    uint8_t  ir_left;          /* 左前红外归一化检测：1=检出障碍(<10cm)  0=无障碍 */
-    uint8_t  ir_right;         /* 右前红外归一化检测：1=检出障碍(<1cm)   0=无障碍 */
-    uint8_t  ir_left_contact;  /* 左前红外去抖后接触标志：1=连续 N 帧检出障碍（2.5级） */
-    uint8_t  ir_right_contact; /* 右前红外去抖后接触标志：1=连续 N 帧检出障碍（3级） */
+    uint8_t  ir_left;          /* 左前红外(2.5级探测器)：0=障碍<10cm  1=无障碍 */
+    uint8_t  ir_right;         /* 右前红外(3级探测器) ：0=障碍<1cm   1=无障碍 */
     int16_t  yaw_deg10;        /* MPU6050 累积航向角 ×10（互补滤波，°×10） */
     int16_t  gz_dps10;         /* MPU6050 Z 轴角速度 ×10（°/s ×10） */
     uint8_t  mpu_ok;           /* MPU6050 通信：1=正常 0=异常 */
@@ -88,8 +85,6 @@ typedef struct {
     uint16_t mq3_raw;          /* MQ-3 酒精 ADC 原始值 0~4095 */
     uint8_t  mq2_ok;           /* MQ-2 状态：1=正常 0=超阈值（错误） */
     uint8_t  mq3_ok;           /* MQ-3 状态：同上 */
-    uint8_t  gas_ok;           /* 气体传感器有效标志：预热/首轮采样后才置1，0 时屏蔽气体报警 */
-    uint8_t  gas_over;         /* 气体超标去抖标志：连续 GAS_CONFIRM_FRAMES 帧超阈值才置1 */
     int8_t   temp_c;           /* DHT11 温度 ℃ */
     uint8_t  humi_pct;         /* DHT11 湿度 %RH */
     uint8_t  dht_ok;           /* DHT11 最近一次读取：1=成功 0=失败 */
@@ -127,8 +122,6 @@ typedef struct {
 #define BT_CMD_UTURN      0x14u  /* "U"  → 遥控掉头 */
 #define BT_CMD_STOP       0x15u  /* "X"  → 遥控停止 */
 #define BT_CMD_TH_QUERY   0x20u  /* "TH" → 查询温湿度（板端回传） */
-#define BT_CMD_RESET      0x21u  /* "RST"→ 软件复位（NVIC_SystemReset 全系统重启） */
-
 
 /* ============================ 全局实例（extern） ============================ */
 extern SensorData_t g_sensor;
@@ -147,6 +140,15 @@ extern osThreadId_t t_display;   /* 显示与声光预警 */
 
 /* ============================ 接口函数 ============================ */
 void App_Init(void);   /* 创建全部队列与任务，在 MX_FREERTOS_Init() 中调用 */
+
+/* 独立看门狗（2026-08-24 新增）：
+ *   App_Watchdog_Init  在 main() 的 HAL_Init 之后尽早调用（IWDG 用 LSI 独立时钟，
+ *                      不依赖系统时钟是否配置成功），超时约 2.7s，一次启动不可关闭；
+ *   App_Watchdog_Feed  由 TaskDisplay 每 50ms 喂一次。任何任务死锁/死循环/跑飞
+ *                      导致停喂，看门狗自动整机复位恢复——"复位后偶发无响应只能
+ *                      断电恢复"从此变为自动恢复。 */
+void App_Watchdog_Init(void);
+void App_Watchdog_Feed(void);
 
 #ifdef __cplusplus
 }

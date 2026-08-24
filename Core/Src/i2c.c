@@ -69,9 +69,7 @@ void MX_I2C2_Init(void)
 
   /* USER CODE END I2C2_Init 1 */
   hi2c2.Instance = I2C2;
-  /* OLED：标准模式 50kHz。面包板/弱上拉(10kΩ)下100kHz易位损坏致错位乱码，
-   * 降到50kHz对噪声/弱上拉最宽容。8 页全刷约 180ms，仅拖慢低优先级显示任务。 */
-  hi2c2.Init.ClockSpeed = 50000;
+  hi2c2.Init.ClockSpeed = 100000;
   hi2c2.Init.DutyCycle = I2C_DUTYCYCLE_2;
   hi2c2.Init.OwnAddress1 = 0;
   hi2c2.Init.AddressingMode = I2C_ADDRESSINGMODE_7BIT;
@@ -139,8 +137,9 @@ void HAL_I2C_MspInit(I2C_HandleTypeDef* i2cHandle)
     __HAL_RCC_I2C2_CLK_ENABLE();
   /* USER CODE BEGIN I2C2_MspInit 1 */
   /* I2C2_TX DMA：手动配置并链接（CubeMX 未勾选），使 Transmit_DMA 可用 */
-  OLED_DMA_Init();
-  __HAL_LINKDMA(i2cHandle, hdmatx, hdma_i2c2_tx);
+  /* 2026-08-24：OLED 改纯轮询传输，I2C2 不再使用 DMA（见 OLED.c 文件头） */
+  /* OLED_DMA_Init();  —— 已停用 */
+  /* __HAL_LINKDMA(i2cHandle, hdmatx, hdma_i2c2_tx);  —— 已停用，轮询无需DMA */
   /* USER CODE END I2C2_MspInit 1 */
 
   /* USER CODE END I2C2_MspInit 1 */

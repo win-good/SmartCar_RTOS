@@ -18,23 +18,10 @@ extern "C" {
 
 #include <stdint.h>
 
-/* 是否启用气体传感器报警（默认关闭）：
- * 上电/移除模块后 ADC 引脚可能读到漂移值，阈值若过低会误触发三档制动；
- * 本毕设三档报警以"红外贴障"为主，气体报警默认关闭更稳。
- * 需要气体报警时改为 1，并在洁净空气实测 baseline 后微调阈值。 */
-#ifndef GAS_ALARM_ENABLE
-#define GAS_ALARM_ENABLE    0u
-#endif
-
 /* 报警阈值（ADC 原始值 0~4095，超过即"错误/超标"）：
- * 12bit ADC 下 MQ 洁净空气典型值约 1800~2500（因模块 RL 不同可能 800~3500）。
- * 原阈值 1600 偏低，洁净空气下就可能触发 → 误报三档。
- * 此处取 3000（需实际超标明显才报警），并配合连续多帧确认去抖，见 app_tasks.c。 */
-#define GAS_MQ2_THRESHOLD   3000u   /* MQ-2 烟雾阈值 */
-#define GAS_MQ3_THRESHOLD   3000u   /* MQ-3 酒精阈值 */
-
-/* 气体超标确认去抖：连续 N 帧（×20ms）超阈值才判定超标，滤除上电/偶发抖动 */
-#define GAS_CONFIRM_FRAMES  10u     /* 10 帧 ×20ms = 200ms */
+ * 洁净空气典型值约数百，1600 ≈ 中段偏上，仅作占位，实测后按模块灵敏度曲线调整 */
+#define GAS_MQ2_THRESHOLD   1600u   /* MQ-2 烟雾阈值 */
+#define GAS_MQ3_THRESHOLD   1600u   /* MQ-3 酒精阈值 */
 
 /**
  * @brief  启动 ADC1+DMA 连续采集（在 MX_FREERTOS_Init 中、任务创建前调用一次）

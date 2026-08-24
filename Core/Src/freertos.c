@@ -79,11 +79,7 @@ void MX_FREERTOS_Init(void) {
   /* 超声波输入捕获初始化（须在 MX_TIM5_Init 之后） */
   HCSR04_Init();
 
-  /* OLED 初始化：先 DeInit+Init 一次 I2C2 确保外设状态干净（避免上次异常
-   * 遗留 BUSY 错误），再调 OLED_Init。I2C2 50kHz 下 ~26 条命令约 80ms。 */
-  extern I2C_HandleTypeDef hi2c2;
-  HAL_I2C_DeInit(&hi2c2);
-  HAL_I2C_Init(&hi2c2);
+  /* OLED 初始化（I2C2 已由 MX_I2C2_Init 配置，内部含上电延时与清屏） */
   OLED_Init();
 
   /* 气体 ADC 连续采集（ADC1+DMA 循环搬运，零 CPU 占用） */

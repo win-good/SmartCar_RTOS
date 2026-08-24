@@ -2,52 +2,34 @@
  ******************************************************************************
  * @file    app_tasks.c
  * @brief   毕设智能小车 FreeRTOS 任务框架 —— 六个任务的实现
- * @author  STM32F407VGT6 + FreeRTOS (CMSIS-RTOS2 封装) + K230 视觉板
  *
- * @details
- * 【预警四级体系】（高级覆盖低级，LED/蜂鸣器/OLED 互斥只显最高级）
- *   一级预警 ：前超声波 <1m       → 减速；绿灯亮；蜂鸣器 2kHz 100ms 间歇
- *   一级警报 ：前超声波 <30cm     → 对比左右超声波转向；黄灯亮；3kHz 150ms 间歇
- *   2.5 级   ：左前红外触发(<10cm)→ 黄灯亮 + 2.5kHz 滴答变调（双音短促）
- *                               +→ 自动转向 / 死胡同掉头
- *   二级警报 ：右前红外(<1cm) 或烟雾/酒精超阈值
- *             → 红灯亮 + 4kHz 长鸣 + 任何模式速度强制清零
+ * 【2026-08-23 重构版】预警四级（高级覆盖低级，声光显示互斥只显最高级）：
+ *   一级预警 ：前超声波 <1m      → 减速；绿灯；2kHz 100ms 间歇
+ *   一级警报 ：前超声波 <30cm    → 对比左右超声波转向；黄灯；3kHz 50ms 间歇
+ *   2.5级    ：左前红外触发(<10cm) → 黄灯 + 2.5k 滴答变调 + 自动转向；
+ *              左右后全堵=死胡同 → 掉头
+ *   二级警报 ：右前红外触发(<1cm) 或 烟雾/酒精超阈值 → 红灯 + 4kHz 长鸣 +
+ *              任何模式速度强制清零
+ * 职责划分：超声波负责 1、2 级；左红外=2.5 级探测器(电位器≈10cm 保持现值)、
+ *          右红外=3 级探测器(电位器调至最近≈1cm)。
  *
- *   传感器分工：
- *     - 4 路 HCSR04 超声波 → 负责 1/2 级（旋转轮询各路距离）
- *     - 左红外(2.5 级电位器≈10cm) / 右红外(3 级电位器≈1cm) → 红外避级
- *     - 烟雾 MQ-2 / 酒精 MQ-3 → 可选二级警报（GAS_ALARM_ENABLE 宏开关）
+ * 蓝牙协议（JDY-31，USART1 9600，手机串口助手发送字符串；2026-08-24 增强）：
+ *   "MA"=切模式1 → 回 "[OK] Mode1 Normal"   "MB"=切模式2 → 回 "[OK] Mode2 Fusion"
+ *   "MC"=切模式3 → 回 "[OK] Mode3 Remote"   "TH"=查询温湿度 → 回 "T:26C H:55%"
+ *   "W"=前进→回"[OK] FWD"  "S"=后退→回"[OK] BACK"  "A"=左转→回"[OK] LEFT"
+ *   "D"=右转→回"[OK] RIGHT" "U"=掉头→回"[OK] UTURN" "X"=停止→回"[OK] STOP"
+ *   未识别指令 → 回 "[ERR] Unknown"。
+ *   每条指令收到即回传状态文本；W/S/A/D/U 在非模式3 下发会自动切到模式3 再执行，
+ *   "X" 停止在任意模式下都立即生效——修复旧版"前进后退无反馈、停止按两次"的 BUG。
  *
- * 【响应时序（"上快下慢"非对称）】
- *   - 升级（检测到障碍）→ 1 帧（20ms）即确认；
- *   - 降级（移开障碍）→ 4 帧（80ms）连续保持更低等级才允许降，
- *     体验上感觉"移开约 1 秒内停止蜂鸣"，与用户需求一致。
+ * 模式按键（2026-08-24 新增，PD0/PD1/PD2，内部上拉低有效）：
+ *   按键1=模式1 / 按键2=模式2 / 按键3=模式3，与蓝牙 MA/MB/MC 等效；
+ *   消抖用"按下锁定 + 三键全松解锁"，长按不会连切。
  *
- * 【六任务框架】（优先级、栈、周期）
- *   TaskSensor   AboveNormal  2KB   20ms   轮询4 路超声波 + 红外去抖 + 气体 + DHT11 + MPU6050
- *   TaskDecision Normal       2KB   20ms   BT/K230 指令解析 + 预警分级（迟滞）+ 模式规划
- *   TaskMotor    AboveNormal  1KB   10ms   TB6612 电机调速（motor_enabled 门控）
- *   TaskBt       Normal       2KB   5ms    USART1 中断逐字节入环形缓冲 → 30ms 静默后解析
- *   TaskK230     Normal       2KB   10ms   USART3 视觉协议（骨架）
- *   TaskDisplay  Low          3KB   50ms   LED 互斥 + 蜂鸣器分档 + OLED 全屏重绘
+ * 可靠性（2026-08-24 新增）：TaskDisplay 每帧喂独立看门狗(约2.7s)并做 OLED
+ *   I2C 自检（总线卡死自动恢复+重初始化），死机/花屏均可自愈。
  *
- * 【蓝牙协议】（JDY-31，USART1 9600 N81）
- *   "MA" / "MB" / "MC"   → 切换模式 1/2/3
- *   "W" / "S" / "A" / "D" → 遥控前后左右（仅模式3 有效）
- *   "U" → 掉头          "X" → 停止
- *   "TH"→ 查询温湿度（板端立即回传 "[TH] T:xxC H:xx%\r\n"）
- *   "RST"→ 软件复位（NVIC_SystemReset 全系统重启）
- *   每条指令解析后立即回传 "[OK] XXX\r\n" 给手机，便于确认指令已收到；
- *   解析器忽略空格/Tab/换行等空白，兼容手机按钮控制模式（按下时尾部带 "\n    "）。
- *
- * 【按键模式切换】（PD0 / PD1 / PD2，内部上拉，低电平触发）
- *   KEY_MODE1（PD0）→ MODE_NORMAL     按下接地 → 模式1（普通避障）
- *   KEY_MODE2（PD1）→ MODE_FUSION     按下接地 → 模式2（融合避障）
- *   KEY_MODE3（PD2）→ MODE_BLUETOOTH  按下接地 → 模式3（蓝牙遥控）
- *
- * 【直行保持】MPU6050 航向积分，直线段偏航 >3° 时差速修正 TB6612。
- *
- * 【默认行为】MODE_IDLE（电机不动，仅传感器预警），需 BT/按键切换才自主移动。
+ * 直行保持：MPU6050 航向积分，直线段偏航 >3° 时差速修正 TB6612。
  ******************************************************************************
  */
 #include "app_rtos.h"
@@ -70,15 +52,7 @@
 #define TH_WARN_CM          100u  /* 一级预警：前超声波 <1m → 减速        */
 #define TH_ALARM_CM         30u   /* 一级警报：前超声波 <30cm → 转向避让  */
 /* 2.5 级 / 3 级由红外二值触发（硬件电位器定距：左≈10cm / 右≈1cm），无软件阈值 */
-#define TH_CONTACT_CM       8u    /* 接触兜底：前超声波 ≤8cm 视为贴障，强制三档  */
 #define TH_DEADEND_CM       20u   /* 死胡同判定：左/右/后均 <20cm → 掉头   */
-
-/* 红外去抖：连续 N 帧检测到障碍才确认，滤除瞬时抖动/噪声 */
-#define IR_DEBOUNCE_FRAMES  1u    /* 1 帧 ×20ms = 20ms 即确认（用户要求"减少识别延迟"） */
-
-/* 预警降级迟滞：等级下降（移开障碍）需连续 N 帧保持更低等级才确认，
- * 避免抖动/回弹反复闪灯/蜂鸣。上升（检测到障碍）保持即时响应 */
-#define ALERT_HOLD_FRAMES   4u    /* 4 帧 ×20ms = 80ms 才允许降级（缩短到接近用户感受的"1 秒"内） */
 
 /* 直行航向修正：偏航超过该值(0.1°)开始差速修正（3° = 30） */
 #define YAW_CORRECT_TH_DEG10  30
@@ -124,32 +98,12 @@ static int Bt_RingGet(void)
  */
 static uint8_t CalcAlertLevel(const SensorData_t *s)
 {
-    /* 传感器未就绪（尚无有效数据）时一律视为无预警，避免上电即误报。
-     * update_tick==0 表示传感任务还没跑满一帧。 */
-    if (s->update_tick == 0u) {
-        return ALERT_NONE;
-    }
-
-    /* --- 二级警报：右前红外接触(<1cm) 或 烟雾/酒精超阈值 ---
-     * 气体报警默认关闭（GAS_ALARM_ENABLE=0），避免 ADC 漂移/上电尖峰误触三档；
-     * 需启用时置 1，且仅在 gas_ok（预热完成）+ gas_over（连续帧确认）后生效。 */
-#if (GAS_ALARM_ENABLE == 1u)
-    if (s->ir_right_contact || (s->gas_ok && s->gas_over)) {
-        return ALERT_LEVEL3;
-    }
-#else
-    if (s->ir_right_contact) {
-        return ALERT_LEVEL3;
-    }
-#endif
-    /* --- 接触兜底：前超声波 ≤8cm（贴障）强制三档，即使红外未触发 ---
-     * 解决"物体贴着红外只显示二档"：红外电平与硬件极性不符时，
-     * 由前超声波近距离兜底保证贴障一定三档。 */
-    if (s->dist_front_cm <= TH_CONTACT_CM) {
+    /* --- 二级警报：右前红外接触(<1cm) 或 烟雾/酒精超阈值 --- */
+    if ((s->ir_right == 0u) || (s->mq2_ok == 0u) || (s->mq3_ok == 0u)) {
         return ALERT_LEVEL3;
     }
     /* --- 2.5级：左前红外触发(<10cm) → 自动转向/死胡同掉头 --- */
-    if (s->ir_left_contact) {
+    if (s->ir_left == 0u) {
         return ALERT_LEVEL25;
     }
     /* --- 一级警报：前超声波 <30cm → 对比左右转向 --- */
@@ -282,65 +236,15 @@ void TaskSensor_Start(void *argument)
         read_idx = trig_idx;
         trig_idx = (uint8_t)((trig_idx + 1u) % HCSR04_NUM);
 
-        /* 超声波卡死自恢复：所有通道连续多次读到 INVALID（无回波）
-         * 视为 TIM5 输入捕获中断丢失，重启 4 路 IC + 中断。 */
-        static uint8_t invalid_streak = 0u;
-        if ((g_sensor.dist_front_cm == HCSR04_INVALID_CM) &&
-            (g_sensor.dist_left_cm  == HCSR04_INVALID_CM) &&
-            (g_sensor.dist_right_cm == HCSR04_INVALID_CM) &&
-            (g_sensor.dist_back_cm  == HCSR04_INVALID_CM)) {
-            if (++invalid_streak >= 8u) {  /* 8 帧 ×20ms ×4 通道 = ~640ms 全无回波 */
-                invalid_streak = 0u;
-                /* 重启 TIM5 全部 4 路输入捕获中断（地址 = tim.h 中已定义 s_echo_ch） */
-                extern TIM_HandleTypeDef htim5;
-                static const uint32_t chs[4] = {TIM_CHANNEL_1, TIM_CHANNEL_2, TIM_CHANNEL_3, TIM_CHANNEL_4};
-                for (uint8_t i = 0u; i < 4u; i++) {
-                    HAL_TIM_IC_Stop_IT(&htim5, chs[i]);
-                    HAL_TIM_IC_Start_IT(&htim5, chs[i]);
-                }
-            }
-        } else {
-            invalid_streak = 0u;
-        }
+        /* 3. 红外（左=2.5级探测器 右=3级探测器） */
+        g_sensor.ir_left  = Infrared_Read(IR_LEFT);
+        g_sensor.ir_right = Infrared_Read(IR_RIGHT);
 
-        /* 3. 红外（左=2.5级探测器 右=3级探测器）
-         * 原始电平存 ir_left/ir_right 供 OLED 显示；去抖后接触标志
-         * ir_left_contact/ir_right_contact 供决策分级。
-         * 用 Infrared_Detected 按 IR_ACTIVE_LEVEL 归一化极性，适配不同模块。 */
-        uint8_t det_l = Infrared_Detected(IR_LEFT);
-        uint8_t det_r = Infrared_Detected(IR_RIGHT);
-        g_sensor.ir_left  = det_l;
-        g_sensor.ir_right = det_r;
-        /* 连续 N 帧检出才置接触标志，清除时立即复位 */
-        static uint8_t irl_cnt = 0, irr_cnt = 0;
-        irl_cnt = det_l ? (uint8_t)(irl_cnt + 1u) : 0u;
-        irr_cnt = det_r ? (uint8_t)(irr_cnt + 1u) : 0u;
-        g_sensor.ir_left_contact  = (irl_cnt >= IR_DEBOUNCE_FRAMES) ? 1u : 0u;
-        g_sensor.ir_right_contact = (irr_cnt >= IR_DEBOUNCE_FRAMES) ? 1u : 0u;
-
-        /* 4. 气体：MQ 上电需预热（传感器热板 20s+ 才稳定），预热完成前
-         *    不认可数据、不参与报警。阈值已提高至 3000，并用连续帧去抖，
-         *    避免上电/移除模块后 ADC 漂移误触发三档。 */
+        /* 4. 气体 */
         g_sensor.mq2_raw = GasSensor_GetMQ2();
         g_sensor.mq3_raw = GasSensor_GetMQ3();
         g_sensor.mq2_ok  = (g_sensor.mq2_raw < GAS_MQ2_THRESHOLD) ? 1u : 0u;
         g_sensor.mq3_ok  = (g_sensor.mq3_raw < GAS_MQ3_THRESHOLD) ? 1u : 0u;
-        if (!g_sensor.gas_ok) {
-            /* 预热约 5s（250 帧）后才认可气体数据（比 1s 更能避开上电尖峰） */
-            static uint32_t gas_warmup = 0u;
-            if (gas_warmup++ >= 250u) {
-                g_sensor.gas_ok = 1u;
-            }
-        }
-        /* 超标去抖：连续 GAS_CONFIRM_FRAMES 帧任一路超阈值才置 gas_over */
-        if (g_sensor.gas_ok) {
-            static uint8_t gas_cnt = 0u;
-            uint8_t over = ((g_sensor.mq2_ok == 0u) || (g_sensor.mq3_ok == 0u)) ? 1u : 0u;
-            gas_cnt = over ? (uint8_t)(gas_cnt + 1u) : 0u;
-            g_sensor.gas_over = (gas_cnt >= GAS_CONFIRM_FRAMES) ? 1u : 0u;
-        } else {
-            g_sensor.gas_over = 0u;
-        }
 
         /* 5. MPU6050 航向积分（20ms 一拍）；停车时自动锚定清零 */
         {
@@ -385,22 +289,33 @@ void TaskDecision_Start(void *argument)
     uint8_t warm_cycles = 0;
 
     for (;;) {
-        /* ---------- 0. 物理按键模式切换（PD0/PD1/PD2，低电平触发，内部上拉） ---------- */
-        static uint8_t key_lock = 0u;  /* 简易防抖：按下置位，松开清零，避免长按连切 */
-        uint8_t k1 = (HAL_GPIO_ReadPin(KEY_MODE1_GPIO_Port, KEY_MODE1_Pin) == GPIO_PIN_RESET) ? 1u : 0u;
-        uint8_t k2 = (HAL_GPIO_ReadPin(KEY_MODE2_GPIO_Port, KEY_MODE2_Pin) == GPIO_PIN_RESET) ? 1u : 0u;
-        uint8_t k3 = (HAL_GPIO_ReadPin(KEY_MODE3_GPIO_Port, KEY_MODE3_Pin) == GPIO_PIN_RESET) ? 1u : 0u;
-        if ((k1 || k2 || k3) && !key_lock) {
-            key_lock = 1u;
-            if      (k1) { g_decision.mode = MODE_NORMAL;     MPU6050_ResetYaw(); }
-            else if (k2) { g_decision.mode = MODE_FUSION;     MPU6050_ResetYaw(); }
-            else if (k3) { g_decision.mode = MODE_BLUETOOTH;  MPU6050_ResetYaw(); }
-        } else if (!(k1 || k2 || k3)) {
-            key_lock = 0u;  /* 全松开后清零，允许下次按键触发 */
+        /* ---------- 0. 模式按键（PD0/PD1/PD2，2026-08-24 新增） ----------
+         * 与蓝牙 MA/MB/MC 等效：按键1=模式1 / 按键2=模式2 / 按键3=模式3。
+         * 消抖策略：首次检测到按下立即切换并置 key_lock，三键全部松开才解锁，
+         * 长按不会连续切换；20ms 任务周期天然滤除毫秒级抖动。 */
+        {
+            static uint8_t key_lock = 0u;
+            uint8_t k1 = (HAL_GPIO_ReadPin(KEY_MODE1_GPIO_Port, KEY_MODE1_Pin) == GPIO_PIN_RESET) ? 1u : 0u;
+            uint8_t k2 = (HAL_GPIO_ReadPin(KEY_MODE2_GPIO_Port, KEY_MODE2_Pin) == GPIO_PIN_RESET) ? 1u : 0u;
+            uint8_t k3 = (HAL_GPIO_ReadPin(KEY_MODE3_GPIO_Port, KEY_MODE3_Pin) == GPIO_PIN_RESET) ? 1u : 0u;
+            if ((k1 || k2 || k3) && !key_lock) {
+                key_lock = 1u;   /* 锁定，防长按连切 */
+                if      (k1) { g_decision.mode = MODE_NORMAL;    MPU6050_ResetYaw(); }
+                else if (k2) { g_decision.mode = MODE_FUSION;    MPU6050_ResetYaw(); }
+                else if (k3) { g_decision.mode = MODE_BLUETOOTH; MPU6050_ResetYaw(); }
+            } else if (!(k1 || k2 || k3)) {
+                key_lock = 0u;   /* 全松解锁，允许下次按键触发 */
+            }
         }
 
         /* ---------- 1. 蓝牙指令 ---------- */
         while (osMessageQueueGet(q_bt_cmd, &cmd, NULL, 0) == osOK) {
+            /* 2026-08-24：TaskBt 对"非模式3下发的遥控指令"置 arg[0]=1，
+             * 此处自动切入模式3 再执行，保证手机端"发W车就走"，与回传文本一致 */
+            if ((cmd.arg[0] == 1) && (g_decision.mode != MODE_BLUETOOTH)) {
+                g_decision.mode = MODE_BLUETOOTH;
+                MPU6050_ResetYaw();
+            }
             switch (cmd.cmd) {
                 case BT_CMD_MODE1: g_decision.mode = MODE_NORMAL;   MPU6050_ResetYaw(); break;
                 case BT_CMD_MODE2: g_decision.mode = MODE_FUSION;   MPU6050_ResetYaw(); break;
@@ -410,11 +325,10 @@ void TaskDecision_Start(void *argument)
                 case BT_CMD_TURNL: g_decision.rc_speed_l = -SPEED_TURN; g_decision.rc_speed_r =  SPEED_TURN; g_decision.rc_active = 1; break;
                 case BT_CMD_TURNR: g_decision.rc_speed_l =  SPEED_TURN; g_decision.rc_speed_r = -SPEED_TURN; g_decision.rc_active = 1; break;
                 case BT_CMD_UTURN: g_decision.rc_speed_l =  SPEED_UTURN; g_decision.rc_speed_r = -SPEED_UTURN; g_decision.rc_active = 1; break;
-                case BT_CMD_STOP:  g_decision.rc_speed_l = 0; g_decision.rc_speed_r = 0; g_decision.rc_active = 1; break;
-                case BT_CMD_RESET:
-                    /* 软件复位：全系统重启（恢复上电默认模式/传感器预热） */
-                    NVIC_SystemReset();
-                    break;
+                case BT_CMD_STOP:  g_decision.rc_speed_l = 0; g_decision.rc_speed_r = 0; g_decision.rc_active = 1;
+                                   /* 2026-08-24：停止跨模式立即生效（安全优先），
+                                    * 不必等下一轮规划，任何模式下收到 X 马上刹车 */
+                                   g_decision.target_speed_l = 0; g_decision.target_speed_r = 0; break;
                 default: break;   /* TH 查询在 TaskBt 内直接回传，不入队列 */
             }
         }
@@ -422,28 +336,9 @@ void TaskDecision_Start(void *argument)
         /* ---------- 2. K230 指令（待串口驱动） ---------- */
         while (osMessageQueueGet(q_k230_cmd, &cmd, NULL, 0) == osOK) { }
 
-        /* ---------- 3. 快照 + 分级（互斥：只保留最高级；带降级迟滞） ----------
-         * 升级（检测到障碍）立即生效；降级（移开障碍）需连续 N 帧保持更低
-         * 等级才确认，避免抖动闪灯/蜂鸣。"上快下慢"的非对称响应。 */
-        static uint8_t lower_count = 0u;
-        static uint8_t last_applied_level = ALERT_NONE;
+        /* ---------- 3. 快照 + 分级（互斥：只保留最高级） ---------- */
         snap = g_sensor;
-        uint8_t new_level = CalcAlertLevel(&snap);
-
-        if (new_level >= last_applied_level) {
-            /* 升级或同级：立即生效 */
-            last_applied_level = new_level;
-            lower_count = 0u;
-        } else {
-            /* 降级：累计连续低帧，达标才允许降 */
-            lower_count = (uint8_t)(lower_count + 1u);
-            if (lower_count >= ALERT_HOLD_FRAMES) {
-                last_applied_level = new_level;
-                lower_count = 0u;
-            }
-            /* 否则保持上一等级，实现"移开约100ms后才停蜂鸣"的舒适体验 */
-        }
-        g_decision.alert_level = last_applied_level;
+        g_decision.alert_level = CalcAlertLevel(&snap);
 
         /* 模式2 融合叠加（只升不降） */
         if ((g_decision.mode == MODE_FUSION) && (snap.fusion_valid)) {
@@ -453,16 +348,8 @@ void TaskDecision_Start(void *argument)
                 g_decision.alert_level = ALERT_LEVEL1;
         }
 
-        /* now 供步骤7预热判定使用；C/R 接管窗口已移除 */
-        uint32_t now = osKernelGetTickCount();
-
         /* ---------- 4. 按模式规划 ---------- */
         switch (g_decision.mode) {
-        case MODE_IDLE:    /* 停止模式：电机不动，仅预警 */
-            g_decision.target_speed_l = 0;
-            g_decision.target_speed_r = 0;
-            g_decision.rc_active = 0;
-            break;
         case MODE_NORMAL:  PlanModeNormal(&snap, &g_decision); break;
         case MODE_FUSION:  PlanModeFusion(&snap, &g_decision); break;
         case MODE_BLUETOOTH:
@@ -486,6 +373,7 @@ void TaskDecision_Start(void *argument)
         }
 
         /* ---------- 7. 预热保护 ---------- */
+        uint32_t now = osKernelGetTickCount();
         uint8_t fresh = (g_sensor.update_tick != 0u) && ((now - g_sensor.update_tick) < 100u);
         warm_cycles = fresh ? (uint8_t)(warm_cycles + 1u) : 0u;
         g_decision.motor_enabled = (warm_cycles >= 4u) ? 1u : 0u;
@@ -515,9 +403,13 @@ void TaskMotor_Start(void *argument)
  *   MA → 切换模式1（普通避障）   MB → 切换模式2（融合避障）
  *   MC → 切换模式3（蓝牙遥控）   TH → 查询温湿度（板端回传 T:xxC H:xx%）
  *   W  → 前进   S → 后退   A → 左转   D → 右转   U → 掉头   X → 停止
- *   RST→ 软件复位（NVIC_SystemReset）
- *   每条指令解析后立即向手机回传 ASCII 状态反馈，便于确认指令已收到。
  */
+/* 蓝牙状态回传辅助：把固定字符串发给手机（9600 下 20 字节约 20ms，80ms 超时足够） */
+static void Bt_Send(const char *s)
+{
+    HAL_UART_Transmit(&huart1, (uint8_t *)s, (uint16_t)strlen(s), 80);
+}
+
 void TaskBt_Start(void *argument)
 {
     (void)argument;
@@ -532,42 +424,44 @@ void TaskBt_Start(void *argument)
         if (c >= 0) {
             last_byte_tick = osKernelGetTickCount();
             if ((char)c != '\r' && (char)c != '\n') {
-                /* 跳过空格/Tab 等无意义空白字符（手机按钮控制模式会在指令后附 "\n    "） */
-                if ((char)c == ' ' || (char)c == '\t') {
-                    /* 忽略，不入缓冲 */
-                } else if (len < (uint8_t)(sizeof(line) - 1u)) {
-                    line[len++] = (char)c;
-                }
+                if (len < (uint8_t)(sizeof(line) - 1u)) line[len++] = (char)c;
             }
         } else {
             /* 30ms 无新字节视为一帧结束 */
             if ((len > 0u) && ((osKernelGetTickCount() - last_byte_tick) >= 30u)) {
-                /* 兜底：剔除末尾可能残留的空白，保证 strcmp 严格匹配 */
-                while ((len > 0u) && (line[len - 1u] == ' ' || line[len - 1u] == '\t')) {
-                    len--;
-                }
                 line[len] = '\0';
                 AppCmd_t cmd = {0};
                 uint8_t hit = 1u;
-                if      (strcmp(line, "MA") == 0) { cmd.cmd = BT_CMD_MODE1;   { const char *_s="[OK] Mode1\r\n"; HAL_UART_Transmit(&huart1,(uint8_t*)_s,strlen(_s),50); } }
-                else if (strcmp(line, "MB") == 0) { cmd.cmd = BT_CMD_MODE2;   { const char *_s="[OK] Mode2\r\n"; HAL_UART_Transmit(&huart1,(uint8_t*)_s,strlen(_s),50); } }
-                else if (strcmp(line, "MC") == 0) { cmd.cmd = BT_CMD_MODE3;   { const char *_s="[OK] Mode3\r\n"; HAL_UART_Transmit(&huart1,(uint8_t*)_s,strlen(_s),50); } }
-                else if (strcmp(line, "W")  == 0) { cmd.cmd = BT_CMD_FWD;     { const char *_s="[OK] FWD\r\n";  HAL_UART_Transmit(&huart1,(uint8_t*)_s,strlen(_s),50); } }
-                else if (strcmp(line, "S")  == 0) { cmd.cmd = BT_CMD_BACK;    { const char *_s="[OK] BACK\r\n"; HAL_UART_Transmit(&huart1,(uint8_t*)_s,strlen(_s),50); } }
-                else if (strcmp(line, "A")  == 0) { cmd.cmd = BT_CMD_TURNL;   { const char *_s="[OK] LEFT\r\n"; HAL_UART_Transmit(&huart1,(uint8_t*)_s,strlen(_s),50); } }
-                else if (strcmp(line, "D")  == 0) { cmd.cmd = BT_CMD_TURNR;   { const char *_s="[OK] RIGHT\r\n";HAL_UART_Transmit(&huart1,(uint8_t*)_s,strlen(_s),50); } }
-                else if (strcmp(line, "U")  == 0) { cmd.cmd = BT_CMD_UTURN;   { const char *_s="[OK] UTURN\r\n";HAL_UART_Transmit(&huart1,(uint8_t*)_s,strlen(_s),50); } }
-                else if (strcmp(line, "X")  == 0) { cmd.cmd = BT_CMD_STOP;    { const char *_s="[OK] STOP\r\n"; HAL_UART_Transmit(&huart1,(uint8_t*)_s,strlen(_s),50); } }
-                else if (strcmp(line, "RST")== 0) { cmd.cmd = BT_CMD_RESET;   { const char *_s="[OK] RST\r\n";  HAL_UART_Transmit(&huart1,(uint8_t*)_s,strlen(_s),50); } }
+                /* 2026-08-24 重构：
+                 *  1) 每条合法指令"收到即回传"状态文本，手机端必有反馈；
+                 *  2) 遥控指令(W/S/A/D/U)若当前不在模式3，先置自动切模式3
+                 *     标志随指令入队，决策任务执行切模式——修复旧版"有反馈车不动、
+                 *     停止要按两次"的体验 BUG（根因：遥控速度只作用于模式3）；
+                 *  3) "X" 停止任何模式立即生效（决策任务内已做跨模式清零）；
+                 *  4) 未识别指令回 [ERR]，便于手机端排查拼写问题。 */
+                if      (strcmp(line, "MA") == 0) { cmd.cmd = BT_CMD_MODE1; Bt_Send("[OK] Mode1 Normal\r\n"); }
+                else if (strcmp(line, "MB") == 0) { cmd.cmd = BT_CMD_MODE2; Bt_Send("[OK] Mode2 Fusion\r\n"); }
+                else if (strcmp(line, "MC") == 0) { cmd.cmd = BT_CMD_MODE3; Bt_Send("[OK] Mode3 Remote\r\n"); }
+                else if (strcmp(line, "W")  == 0) { cmd.cmd = BT_CMD_FWD;   Bt_Send("[OK] FWD\r\n"); }
+                else if (strcmp(line, "S")  == 0) { cmd.cmd = BT_CMD_BACK;  Bt_Send("[OK] BACK\r\n"); }
+                else if (strcmp(line, "A")  == 0) { cmd.cmd = BT_CMD_TURNL; Bt_Send("[OK] LEFT\r\n"); }
+                else if (strcmp(line, "D")  == 0) { cmd.cmd = BT_CMD_TURNR; Bt_Send("[OK] RIGHT\r\n"); }
+                else if (strcmp(line, "U")  == 0) { cmd.cmd = BT_CMD_UTURN; Bt_Send("[OK] UTURN\r\n"); }
+                else if (strcmp(line, "X")  == 0) { cmd.cmd = BT_CMD_STOP;  Bt_Send("[OK] STOP\r\n"); }
                 else if (strcmp(line, "TH") == 0) {
                     /* 温湿度查询：直接回传，不入决策队列 */
                     char rep[24];
-                    int n = snprintf(rep, sizeof(rep), "[TH] T:%dC H:%u%%\r\n",
+                    int n = snprintf(rep, sizeof(rep), "T:%dC H:%u%%\r\n",
                                      g_sensor.temp_c, g_sensor.humi_pct);
-                    HAL_UART_Transmit(&huart1, (uint8_t *)rep, (uint16_t)n, 50);
+                    HAL_UART_Transmit(&huart1, (uint8_t *)rep, (uint16_t)n, 80);
                 }
-                else hit = 0u;
+                else { hit = 0u; Bt_Send("[ERR] Unknown\r\n"); }
                 if (hit && (cmd.cmd != 0u)) {
+                    /* 遥控指令且不在模式3：arg[0]=1 通知决策任务自动切模式3 */
+                    if ((cmd.cmd >= BT_CMD_FWD) && (cmd.cmd <= BT_CMD_UTURN) &&
+                        (g_decision.mode != MODE_BLUETOOTH)) {
+                        cmd.arg[0] = 1;
+                    }
                     osMessageQueuePut(q_bt_cmd, &cmd, 0, 0);
                 }
                 len = 0;
@@ -597,17 +491,15 @@ static void OLED_ShowDistCm(int16_t x, int16_t y, uint16_t dist_cm)
 void TaskDisplay_Start(void *argument)
 {
     (void)argument;
-
-    /* OLED 已在 freertos.c（MX_FREERTOS_Init）中初始化完毕，
-     * 此处不再重复初始化（重复初始化会导致 I2C 状态错乱、显示失败）。 */
-
     for (;;) {
-        uint8_t lv = g_decision.alert_level;
+        /* 2026-08-24 可靠性双保险（本任务 50ms 周期，是唯一稳定慢节奏任务）：
+         *  1) 喂独立看门狗：任何任务死锁/跑飞导致本任务停摆，约2.7s后整机自动复位；
+         *  2) OLED I2C 自检：I2C2 卡 BUSY 或 SDA 被拉死时自动恢复总线并重初始化，
+         *     花屏/黑屏一帧内自愈，不再累积错位乱码。 */
+        App_Watchdog_Feed();
+        OLED_I2C_SelfCheck();
 
-        /* --- 清屏：彻底解决"下半屏残影/上一帧阴影"问题 ---
-         * 之前每行只清部分区域（F:/R: 标签 + 3 位距离），8x16 行右侧 x=104-128
-         * 的 24px 永远不会被写入，上一帧内容残留；现在直接全屏清，再统一重绘。 */
-        OLED_Clear();
+        uint8_t lv = g_decision.alert_level;
 
         /* --- LED 互斥：只点亮当前最高级对应灯（灌电流：低电平点亮） --- */
         HAL_GPIO_WritePin(LED_G_GPIO_Port, LED_G_Pin, (lv == ALERT_LEVEL1) ? GPIO_PIN_RESET : GPIO_PIN_SET);
@@ -615,24 +507,24 @@ void TaskDisplay_Start(void *argument)
             ((lv == ALERT_LEVEL2) || (lv == ALERT_LEVEL25)) ? GPIO_PIN_RESET : GPIO_PIN_SET);
         HAL_GPIO_WritePin(LED_R_GPIO_Port, LED_R_Pin, (lv == ALERT_LEVEL3) ? GPIO_PIN_RESET : GPIO_PIN_SET);
 
-        /* --- 蜂鸣器分档（缩短周期到 200ms 一轮，遮挡响应延迟 ≤200ms，
-         *     兼顾柔和间歇与即时反馈，避免"等1秒才响"的体验问题） --- */
+        /* --- 蜂鸣器分档（频率由低到高）：1=2k间歇 2=3k间歇 2.5=2.5k滴答 3=4k长鸣 --- */
         static uint8_t tick_cnt = 0;
-        tick_cnt = (uint8_t)((tick_cnt + 1u) & 0x03u);  /* 4 拍一轮：50/100/150/200ms */
+        tick_cnt = (uint8_t)((tick_cnt + 1u) & 0x0Fu);
         switch (lv) {
-            case ALERT_LEVEL1:   /* 一级预警：2kHz，100ms 响 / 100ms 停（轻柔间歇） */
-                if (tick_cnt < 2u) Beep_SetFreq(BEEP_FREQ_LEVEL1_HZ); else Beep_Off();
+            case ALERT_LEVEL1:   /* 100ms 响 / 100ms 停（50ms 一拍×2） */
+                if (tick_cnt & 0x02u) Beep_SetFreq(BEEP_FREQ_LEVEL1_HZ); else Beep_Off();
                 break;
-            case ALERT_LEVEL2:   /* 一级警报：3kHz，150ms 响 / 50ms 停（急促提示） */
-                if (tick_cnt < 3u) Beep_SetFreq(BEEP_FREQ_LEVEL2_HZ); else Beep_Off();
+            case ALERT_LEVEL2:   /* 50ms 响 / 50ms 停 */
+                if (tick_cnt & 0x01u) Beep_SetFreq(BEEP_FREQ_LEVEL2_HZ); else Beep_Off();
                 break;
-            case ALERT_LEVEL25:  /* 2.5 级：间歇"滴滴"短促双音，明确"自动避障转向中"提示 */
-                /* 200ms 周期内：50ms 高频+50ms 低频各响一次（共100ms），余100ms停 */
-                if      (tick_cnt == 0u) Beep_SetFreq(BEEP_FREQ_LEVEL25_HZ); /* 2.5kHz 滴 */
-                else if (tick_cnt == 1u) Beep_SetFreq(BEEP_FREQ_LEVEL1_HZ);  /* 2kHz   滴 */
-                else                     Beep_Off();
+            case ALERT_LEVEL25:  /* 滴答变调：2.5k 与 2k 交替短音 */
+                if (tick_cnt & 0x04u) {
+                    Beep_SetFreq((tick_cnt & 0x02u) ? BEEP_FREQ_LEVEL25_HZ : BEEP_FREQ_LEVEL1_HZ);
+                } else {
+                    Beep_Off();
+                }
                 break;
-            case ALERT_LEVEL3:   /* 二级警报：4kHz 长鸣（持续高音警示） */
+            case ALERT_LEVEL3:   /* 长鸣 */
                 Beep_SetFreq(BEEP_FREQ_LEVEL3_HZ);
                 break;
             default:
@@ -674,10 +566,10 @@ void TaskDisplay_Start(void *argument)
             uint16_t df = g_sensor.dist_front_cm;
             char l3[20];
             l3[0] = '\0';
-            if (df <= TH_WARN_CM)   strcat(l3, "1 ");
-            if (df <= TH_ALARM_CM)  strcat(l3, "2 ");
-            if (g_sensor.ir_left_contact)  strcat(l3, "2.5 ");
-            if (lv == ALERT_LEVEL3) strcat(l3, "3 ");
+            if (df <= TH_WARN_CM)  strcat(l3, "1 ");
+            if (df <= TH_ALARM_CM) strcat(l3, "2 ");
+            if (g_sensor.ir_left == 0u)  strcat(l3, "2.5 ");
+            if (lv == ALERT_LEVEL3)      strcat(l3, "3 ");
             snprintf(buf, sizeof(buf), "ALARM:%-13s", (l3[0] ? l3 : "--"));
             OLED_ShowString(0, 48, "                     ", OLED_6X8);
             OLED_ShowString(0, 48, buf, OLED_6X8);

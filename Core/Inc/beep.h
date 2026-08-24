@@ -51,22 +51,4 @@ void Beep_SetFreq(uint32_t freq_hz);
  */
 void Beep_Off(void);
 
-/* 蜂鸣器发声等级（对应三级预警"频率由低到高"，供 TaskDisplay 调用） */
-typedef enum
-{
-  BEEP_LVL1 = 0,   /* 一级预警：2kHz  低频间歇 */
-  BEEP_LVL2,       /* 一级警报：3kHz  中频间歇 */
-  BEEP_LVL25,      /* 2.5档  ：2.5kHz 滴答变调 */
-  BEEP_LVL3        /* 二级警报：4kHz  高频长鸣 */
-} Beep_Level_t;
-
-/**
- * @brief  按预警等级播放/静默蜂鸣器
- * @param  level 发声等级 BEEP_LVL1~BEEP_LVL3
- * @param  on    1=按该等级频率发声  0=静默
- * @note   上层每隔 50ms 调用，间歇节奏（如 2 格响/3 格停）由上层计数控制，
- *         on=0 时本函数置静默，避免每次循环都手动调 Beep_Off。
- */
-void Beep_Play(Beep_Level_t level, uint8_t on);
-
 #endif /* __BEEP_H */

@@ -93,11 +93,14 @@ void MX_GPIO_Init(void)
   GPIO_InitStruct.Speed = GPIO_SPEED_FREQ_HIGH;
   HAL_GPIO_Init(LED1_GPIO_Port, &GPIO_InitStruct);
 
-  /*Configure GPIO pins : PDPin PDPin PDPin  模式按键输入（PD0/PD1/PD2，内部上拉，低电平触发） */
+  /* USER CODE BEGIN MX_GPIO_Init_Keys */
+  /* 2026-08-24 新增：三个模式按键输入（PD0/PD1/PD2，内部上拉，按下=低电平）
+   * 按键另一端接 GND；消抖由决策任务的"按下锁定+全松解锁"软件逻辑完成。 */
   GPIO_InitStruct.Pin = KEY_MODE1_Pin | KEY_MODE2_Pin | KEY_MODE3_Pin;
   GPIO_InitStruct.Mode = GPIO_MODE_INPUT;
   GPIO_InitStruct.Pull = GPIO_PULLUP;
   HAL_GPIO_Init(KEY_MODE1_GPIO_Port, &GPIO_InitStruct);
+  /* USER CODE END MX_GPIO_Init_Keys */
 
 }
 

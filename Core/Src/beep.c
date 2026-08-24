@@ -86,26 +86,3 @@ void Beep_Off(void)
 {
     __HAL_TIM_SET_COMPARE(&s_htim4, BEEP_TIM_CH, 0u);
 }
-
-/**
- * @brief  按预警等级播放/静默蜂鸣器
- * @param  level 发声等级 BEEP_LVL1~BEEP_LVL3
- * @param  on    1=发声  0=静默
- */
-void Beep_Play(Beep_Level_t level, uint8_t on)
-{
-    if (!on)
-    {
-        Beep_Off();
-        return;
-    }
-
-    switch (level)
-    {
-        case BEEP_LVL1:  Beep_SetFreq(BEEP_FREQ_LEVEL1_HZ);   break;  /* 2kHz  一级预警 */
-        case BEEP_LVL2:  Beep_SetFreq(BEEP_FREQ_LEVEL2_HZ);   break;  /* 3kHz  一级警报 */
-        case BEEP_LVL25: Beep_SetFreq(BEEP_FREQ_LEVEL25_HZ);  break;  /* 2.5kHz 滴答 */
-        case BEEP_LVL3:  Beep_SetFreq(BEEP_FREQ_LEVEL3_HZ);   break;  /* 4kHz  二级警报 */
-        default:         Beep_Off();                          break;
-    }
-}

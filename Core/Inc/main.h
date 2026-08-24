@@ -88,20 +88,19 @@ void Error_Handler(void);
 #define LED1_Pin GPIO_PIN_5
 #define LED1_GPIO_Port GPIOB
 
-/* ============================ 模式按键（PD0/PD1/PD2，低电平触发，内部上拉） ============================
- * PD0/1/2 在 STM32F407VGT6 上为 FSMC D2/D3/D4，未被现有外设占用，开发板两排 22pin 引脚上
- * 通常引出，相邻便于接线。PD 端口已在 gpio.c 中使能时钟。
- * KEY_MODE1_Pin → MODE_NORMAL     按下接地 → 切换到模式1（普通避障）
- * KEY_MODE2_Pin → MODE_FUSION     按下接地 → 切换到模式2（融合避障）
- * KEY_MODE3_Pin → MODE_BLUETOOTH   按下接地 → 切换到模式3（蓝牙遥控） */
+/* USER CODE BEGIN Private defines */
+/* 2026-08-24 新增：三个实体模式按键（借鉴优化版工程，引脚不冲突）
+ *   PD0 = 按键1 → 模式1 普通避障
+ *   PD1 = 按键2 → 模式2 融合避障
+ *   PD2 = 按键3 → 模式3 蓝牙遥控
+ * 硬件接法：按键一端接对应引脚、另一端接 GND；软件内部上拉，按下=低电平。
+ * PD0~PD2 在 V2 引脚分配表中为空闲脚，与现有外设无冲突。 */
 #define KEY_MODE1_Pin       GPIO_PIN_0
 #define KEY_MODE1_GPIO_Port GPIOD
 #define KEY_MODE2_Pin       GPIO_PIN_1
 #define KEY_MODE2_GPIO_Port GPIOD
 #define KEY_MODE3_Pin       GPIO_PIN_2
 #define KEY_MODE3_GPIO_Port GPIOD
-
-/* USER CODE BEGIN Private defines */
 
 /* USER CODE END Private defines */
 

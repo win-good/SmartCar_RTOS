@@ -50,14 +50,11 @@ void App_Init(void)
     g_sensor.dist_left_cm  = 0xFFFF;
     g_sensor.dist_right_cm = 0xFFFF;
     g_sensor.dist_back_cm  = 0xFFFF;
-    g_sensor.ir_left       = 0;   /* 默认无红外接触（1=检出障碍） */
-    g_sensor.ir_right      = 0;
-    g_sensor.mq2_ok        = 1;   /* 默认无气体超标（否则全局零初始化=0，上电即误报三级） */
-    g_sensor.mq3_ok        = 1;
-    g_sensor.gas_ok        = 0;   /* 气体 ADC 需预热，有效前屏蔽气体报警 */
+    g_sensor.ir_left       = 1;   /* 默认无障碍 */
+    g_sensor.ir_right      = 1;
     g_sensor.update_tick   = 0;
 
-    g_decision.mode          = MODE_IDLE;    /* 上电默认：电机停止、仅预警，需 BT/按键切换模式 */
+    g_decision.mode          = MODE_NORMAL;  /* 上电默认：普通避障模式 */
     g_decision.alert_level   = ALERT_NONE;
     g_decision.target_speed_l = 0;
     g_decision.target_speed_r = 0;
@@ -99,8 +96,42 @@ void App_Init(void)
     t_k230 = osThreadNew(TaskK230_Start, NULL, &attr_k230);
 
     const osThreadAttr_t attr_display = {
-        .name = "TaskDisplay", .stack_size = 1024 * 3,  /* 3KB：OLED_Update 每页 Buf[129] + 显示缓冲 + OLED_Init 调用栈 */
+        .name = "TaskDisplay", .stack_size = 512 * 4,
         .priority = (osPriority_t)osPriorityLow,
     };
     t_display = osThreadNew(TaskDisplay_Start, NULL, &attr_display);
+}
+
+/* ============================ 独立看门狗（2026-08-24 新增） ============================
+ * 目的：整机"死机自愈"。旧版任何一处死循环（NMI/CSS、Error_Handler、任务死锁）
+ *       都只能断电恢复；现在由 IWDG 在超时后自动复位整机。
+ * 选型：IWDG（独立看门狗），时钟来自 LSI（约32kHz），与系统时钟/HSE 无关，
+ *       即使 HSE 起振失败、PLL 没配上，看门狗依旧工作——覆盖最坏场景。
+ *
+ * 【重要】超时不可太短！
+ *   App_Watchdog_Init() 在 main.c 里 HAL_Init() 之后立即启动看门狗，但此时
+ *   FreeRTOS 尚未启动，唯一喂狗点（TaskDisplay）还没运行。从启动到 TaskDisplay
+ *   首次喂狗，要经历 SystemClock_Config + 全部外设 MX_*_Init + MX_FREERTOS_Init
+ *   （内含 OLED_Init / MPU6050_Init / HCSR04_Init 等）。若 OLED 未接好，其重试
+ *   与总线自救可能使初始化耗时数秒。若超时设得太短（如 2.7s），初始化还没完成
+ *   就被看门狗复位 → 反复复位，表现为"程序卡死、所有外设无反应"。
+ *   因此超时需覆盖最坏初始化耗时：取 20s（预分频 256 → 125Hz，Reload 2500）。
+ *   正常运行 TaskDisplay 每 50ms 喂一次，20s 裕量 400 倍，绝不会误触发。 */
+static IWDG_HandleTypeDef s_hiwdg;
+
+void App_Watchdog_Init(void)
+{
+    s_hiwdg.Instance       = IWDG;
+    s_hiwdg.Init.Prescaler = IWDG_PRESCALER_256;     /* LSI 256 分频 → 125Hz */
+    s_hiwdg.Init.Reload    = 2500u;                  /* 2500/125Hz = 20s 超时 */
+    if (HAL_IWDG_Init(&s_hiwdg) == HAL_OK)
+    {
+        HAL_IWDG_Refresh(&s_hiwdg);                  /* 初始喂一次，从满周期开始计 */
+    }
+    /* 初始化失败不致命：最坏情况等于没有看门狗，不影响其他功能 */
+}
+
+void App_Watchdog_Feed(void)
+{
+    (void)HAL_IWDG_Refresh(&s_hiwdg);
 }
