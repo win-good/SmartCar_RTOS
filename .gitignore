@@ -1,0 +1,157 @@
+# ============================================================
+#  SmartCar_RTOS —— STM32F407VGT6 智能小车固件工程
+#  构建环境：Keil MDK-ARM (uVision5) + STM32CubeMX + FreeRTOS
+#  规则目标：只纳入源码与工程配置，排除一切本地缓存与编译产物
+# ============================================================
+
+# ---------- Keil MDK 编译输出（本工程主要体积来源，约 84 MB） ----------
+# MDK-ARM 的输出子目录（.o/.crf/.d/.axf/.hex/.map 等全部在此生成）
+MDK-ARM/SmartCar_RTOS/
+MDK-ARM/Objects/
+MDK-ARM/Listings/
+# 兼容其他工程命名习惯的输出目录
+Objects/
+Listings/
+Output/
+output/
+RTE/_SmartCar_RTOS/*.bak
+
+# ---------- 编译中间产物与目标文件 ----------
+*.o
+*.obj
+*.crf
+*.d
+*.dep
+*.lnp
+*.lst
+*.map
+*.axf
+*.elf
+*.hex
+*.bin
+*.sct
+*.build_log.htm
+*.iex
+*.tra
+*.bak
+*.scr
+*.opt
+*.plg
+*.ncb
+*.idb
+*.ilk
+*.pdb
+*.exp
+*.lib
+!Drivers/**/*.lib
+
+# ---------- Keil 构建日志 ----------
+build_log*.txt
+build_log*.htm
+*.log
+!.vscode/settings.json
+
+# ---------- Keil uVision 用户界面布局（随窗口位置变化，每人不同） ----------
+*.uvguix
+*.uvguix.*
+*.uvgui.*
+# 注意：保留 .uvprojx（工程结构）与 .uvoptx（调试器/断点配置），
+#       二者是工程可复现构建的必要配置，需要纳入版本管理。
+
+# ---------- VS Code / Keil Assistant 本地缓存 ----------
+.vscode/*
+!.vscode/c_cpp_properties.json
+!.vscode/settings.json
+!.vscode/launch.json
+!.vscode/tasks.json
+*.log.lock
+.ipch/
+*.ipch
+.cache/
+
+# ---------- STM32CubeMX 临时文件（保留 .ioc 与 .mxproject） ----------
+*.ioc.bak
+*.mxproject.bak
+~*
+
+# ---------- 调试器 / 烧录器本地状态 ----------
+DebugConfig/*.bak
+*.jflash
+JLinkLog.txt
+JLinkSettings.ini
+ST-LINK*.txt
+*.uvoptx.bak
+
+# ---------- AI 编程助手本地工作区（个人上下文，非工程代码） ----------
+.codebuddy/
+.claude/
+.cursor/
+.aider*
+.continue/
+
+# ---------- 操作系统缓存与缩略图 ----------
+Thumbs.db
+Thumbs.db:encryptable
+ehthumbs.db
+ehthumbs_vista.db
+Desktop.ini
+desktop.ini
+$RECYCLE.BIN/
+.DS_Store
+.AppleDouble
+.LSOverride
+Icon
+.Spotlight-V100
+.Trashes
+
+# ---------- 临时文件与备份 ----------
+*.tmp
+*.temp
+*.swp
+*.swo
+*~
+*.orig
+*.rej
+*.old
+*.bak.*
+备份/
+临时/
+temp/
+tmp/
+
+# ---------- 压缩包（避免把整包工程重复入库） ----------
+*.zip
+*.rar
+*.7z
+*.tar
+*.gz
+
+# ---------- Python 缓存（本工程含上位机数据处理脚本时使用） ----------
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+env/
+
+# ---------- 大型数据集与模型权重（不应入库，请用外部存储/Release 分发） ----------
+datasets/
+dataset/
+weights/
+*.pt
+*.pth
+*.onnx
+*.tflite
+*.ckpt
+*.h5
+*.pkl
+*.npy
+*.npz
+
+# ---------- 敏感信息（防止密钥意外公开） ----------
+.env
+.env.*
+*.pem
+*.key
+credentials.json
+secrets.*

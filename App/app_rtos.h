@@ -1,0 +1,155 @@
+/**
+ ******************************************************************************
+ * @file    app_rtos.h
+ * @brief   毕设智能小车 FreeRTOS 任务框架 —— 公共定义（任务句柄/队列/共享数据）
+ * @note    对齐《毕设引脚分配表 STM32F407VGT6（V2 定稿）》与双主控三模式架构。
+ *
+ * 【2026-08-23 预警分档重构（用户实测后定稿）】四级语义、高级覆盖低级：
+ *   一级预警(ALERT_LEVEL1)：前超声波 <1m      → 减速；绿灯；2kHz 间歇
+ *   一级警报(ALERT_LEVEL2)：前超声波 <30cm    → 对比左右超声波转向；黄灯；3kHz 间歇
+ *   2.5级 (ALERT_LEVEL25) ：左前红外触发(<10cm,电位器保持现值)
+ *                         → 黄灯 + 滴答变调音 + 自动转向；左右后皆堵=死胡同→掉头
+ *   二级警报(ALERT_LEVEL3)：右前红外触发(<1cm,电位器调至最近) 或 烟雾/酒精超阈值
+ *                         → 红灯 + 4kHz 长鸣 + 任何模式速度强制清零
+ *   显示互斥：同一时刻 LED/蜂鸣器/OLED 只显示当前最高级，低级不残留。
+ *   超声波负责 1、2 级；红外负责 2.5、3 级（左红外=2.5@10cm，右红外=3@1cm）。
+ *
+ * 蜂鸣器硬件：无源、低电平触发模块，引脚 PD12(TIM4_CH1)——PB0 未从排针引出，
+ * 按原理图改接空闲脚；静默=IO 常高，分档 2k/2.5k/3k/4kHz（beep 模块）。
+ ******************************************************************************
+ */
+#ifndef APP_RTOS_H
+#define APP_RTOS_H
+
+#ifdef __cplusplus
+extern "C" {
+#endif
+
+#include "main.h"
+#include "cmsis_os2.h"
+#include <stdint.h>
+
+/* ============================ 引脚宏映射 ============================
+ * CubeMX main.h 采用板级丝印命名，此层映射为语义命名，便于任务代码阅读。
+ *   HCSR04Q/Z/Y/H = 前/左/右/后 超声波 Trig（PE2~PE5）
+ *   HW01Z=左前红外(2.5级探测器,电位器≈10cm)  HW01Y=右前红外(3级探测器,电位器≈1cm)
+ *   LED2(PE14)=绿/一级  LED3(PE15)=黄/二级与2.5级  LED1(PB5)=红/三级
+ * 若日后在 CubeMX 中把 Label 直接改成语义名并重新生成，可删除本映射块。 */
+#define Trig_F_Pin        HCSR04Q_Pin
+#define Trig_F_GPIO_Port  HCSR04Q_GPIO_Port
+#define Trig_L_Pin        HCSR04Z_Pin
+#define Trig_L_GPIO_Port  HCSR04Z_GPIO_Port
+#define Trig_R_Pin        HCSR04Y_Pin
+#define Trig_R_GPIO_Port  HCSR04Y_GPIO_Port
+#define Trig_B_Pin        HCSR04H_Pin
+#define Trig_B_GPIO_Port  HCSR04H_GPIO_Port
+#define IR_L_Pin          HW01Z_Pin
+#define IR_L_GPIO_Port    HW01Z_GPIO_Port
+#define IR_R_Pin          HW01Y_Pin
+#define IR_R_GPIO_Port    HW01Y_GPIO_Port
+#define LED_G_Pin         LED2_Pin
+#define LED_G_GPIO_Port   LED2_GPIO_Port
+#define LED_Y_Pin         LED3_Pin
+#define LED_Y_GPIO_Port   LED3_GPIO_Port
+#define LED_R_Pin         LED1_Pin
+#define LED_R_GPIO_Port   LED1_GPIO_Port
+
+/* ============================ 常量定义 ============================ */
+#define MODE_IDLE        0u   /* 默认/停止：电机不动，仅传感器预警（不自主移动）   */
+#define MODE_NORMAL      1u   /* 模式1：普通避障（红外+超声波，无视觉）            */
+#define MODE_FUSION      2u   /* 模式2：高级智能融合避障（K230视觉+雷达+姿态）      */
+#define MODE_BLUETOOTH   3u   /* 模式3：蓝牙遥控（人控+机警，危险工况自动预警）     */
+
+/* 四级预警语义（2026-08-23 重构）：数值越大等级越高，显示互斥只显最高级 */
+#define ALERT_NONE       0u   /* 无预警                                          */
+#define ALERT_LEVEL1     1u   /* 一级预警：减速（前超声波<1m）                    */
+#define ALERT_LEVEL2     2u   /* 一级警报：转向避让（前超声波<30cm）              */
+#define ALERT_LEVEL25    3u   /* 2.5级：红外<10cm，滴答音+自动转向/死胡同掉头     */
+#define ALERT_LEVEL3     4u   /* 二级警报：红外<1cm 或气体超标，红灯长鸣强制制动  */
+
+#define CMD_MAX_ARGS     4    /* 每条指令最多携带的参数个数                        */
+
+/* ============================ 共享数据结构 ============================ */
+
+/* 传感器数据汇总（TaskSensor 周期写入，其余任务只读） */
+typedef struct {
+    uint16_t dist_front_cm;    /* 前超声波距离，0xFFFF = 超量程/无效 */
+    uint16_t dist_left_cm;
+    uint16_t dist_right_cm;
+    uint16_t dist_back_cm;
+    uint8_t  ir_left;          /* 左前红外归一化检测：1=检出障碍(<10cm)  0=无障碍 */
+    uint8_t  ir_right;         /* 右前红外归一化检测：1=检出障碍(<1cm)   0=无障碍 */
+    uint8_t  ir_left_contact;  /* 左前红外去抖后接触标志：1=连续 N 帧检出障碍（2.5级） */
+    uint8_t  ir_right_contact; /* 右前红外去抖后接触标志：1=连续 N 帧检出障碍（3级） */
+    int16_t  yaw_deg10;        /* MPU6050 累积航向角 ×10（互补滤波，°×10） */
+    int16_t  gz_dps10;         /* MPU6050 Z 轴角速度 ×10（°/s ×10） */
+    uint8_t  mpu_ok;           /* MPU6050 通信：1=正常 0=异常 */
+    uint16_t mq2_raw;          /* MQ-2 烟雾 ADC 原始值 0~4095 */
+    uint16_t mq3_raw;          /* MQ-3 酒精 ADC 原始值 0~4095 */
+    uint8_t  mq2_ok;           /* MQ-2 状态：1=正常 0=超阈值（错误） */
+    uint8_t  mq3_ok;           /* MQ-3 状态：同上 */
+    uint8_t  gas_ok;           /* 气体传感器有效标志：预热/首轮采样后才置1，0 时屏蔽气体报警 */
+    uint8_t  gas_over;         /* 气体超标去抖标志：连续 GAS_CONFIRM_FRAMES 帧超阈值才置1 */
+    int8_t   temp_c;           /* DHT11 温度 ℃ */
+    uint8_t  humi_pct;         /* DHT11 湿度 %RH */
+    uint8_t  dht_ok;           /* DHT11 最近一次读取：1=成功 0=失败 */
+    uint16_t fusion_dist_cm;   /* 模式2：K230 视觉+毫米波雷达融合距离（cm），0xFFFF=无效 */
+    uint8_t  fusion_valid;     /* 模式2：融合距离本帧有效标志（TaskK230 写入） */
+    uint32_t update_tick;      /* 最近一次更新的系统 tick，供数据新鲜度判断 */
+} SensorData_t;
+
+/* 决策结果（TaskDecision 写入，电机/显示任务只读） */
+typedef struct {
+    uint8_t mode;              /* 当前工作模式 MODE_xxx */
+    uint8_t alert_level;       /* 当前预警等级 ALERT_xxx（显示互斥，只此一级） */
+    int16_t target_speed_l;    /* 左电机目标速度：-100 ~ +100（负值后退） */
+    int16_t target_speed_r;    /* 右电机目标速度：同上 */
+    uint8_t  motor_enabled;    /* 1=电机允许运行  0=紧急制动 */
+    int16_t  rc_speed_l;       /* 模式3 蓝牙遥控目标速度（TaskBt/Decision 写入） */
+    int16_t  rc_speed_r;
+    uint8_t  rc_active;        /* 1=本周期内有遥控指令（模式3 才使用） */
+} Decision_t;
+
+/* 蓝牙/K230 解析后的指令（队列元素） */
+typedef struct {
+    uint8_t cmd;               /* 指令码（协议层定义） */
+    int16_t arg[CMD_MAX_ARGS]; /* 参数（如目标速度、识别类别、距离等） */
+} AppCmd_t;
+
+/* 蓝牙指令码（与手机端发送字符串一一对应，详见 app_tasks.c 协议表注释） */
+#define BT_CMD_MODE1      0x01u  /* "MA" → 模式1 */
+#define BT_CMD_MODE2      0x02u  /* "MB" → 模式2 */
+#define BT_CMD_MODE3      0x03u  /* "MC" → 模式3 */
+#define BT_CMD_FWD        0x10u  /* "W"  → 遥控前进 */
+#define BT_CMD_BACK       0x11u  /* "S"  → 遥控后退 */
+#define BT_CMD_TURNL      0x12u  /* "A"  → 遥控左转 */
+#define BT_CMD_TURNR      0x13u  /* "D"  → 遥控右转 */
+#define BT_CMD_UTURN      0x14u  /* "U"  → 遥控掉头 */
+#define BT_CMD_STOP       0x15u  /* "X"  → 遥控停止 */
+#define BT_CMD_TH_QUERY   0x20u  /* "TH" → 查询温湿度（板端回传） */
+#define BT_CMD_RESET      0x21u  /* "RST"→ 软件复位（NVIC_SystemReset 全系统重启） */
+
+
+/* ============================ 全局实例（extern） ============================ */
+extern SensorData_t g_sensor;
+extern Decision_t   g_decision;
+
+extern osMessageQueueId_t q_bt_cmd;   /* 蓝牙指令队列（TaskBt  → TaskDecision） */
+extern osMessageQueueId_t q_k230_cmd; /* K230 指令队列（TaskK230 → TaskDecision） */
+
+/* ============================ 任务句柄（extern） ============================ */
+extern osThreadId_t t_sensor;    /* 传感采集 */
+extern osThreadId_t t_decision;  /* 决策状态机 */
+extern osThreadId_t t_motor;     /* 电机控制 */
+extern osThreadId_t t_bt;        /* 蓝牙通信 */
+extern osThreadId_t t_k230;      /* K230 通信 */
+extern osThreadId_t t_display;   /* 显示与声光预警 */
+
+/* ============================ 接口函数 ============================ */
+void App_Init(void);   /* 创建全部队列与任务，在 MX_FREERTOS_Init() 中调用 */
+
+#ifdef __cplusplus
+}
+#endif
+
+#endif /* APP_RTOS_H */
