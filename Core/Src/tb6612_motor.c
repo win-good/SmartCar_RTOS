@@ -127,7 +127,13 @@ void TB6612_Motor_SetSpeedPercent(int16_t left_pct, int16_t right_pct)
  */
 void TB6612_Motor_Stop(void)
 {
+  /* 2026-08-28：零速默认短路制动把车定住（MOTOR_STOP_USE_BRAKE=1），
+   * 解决"上电待命轮子自由转/不静止"；改宏 0 回退滑行停止。 */
+#if (MOTOR_STOP_USE_BRAKE == 1)
+  TB6612_Motor_Brake();
+#else
   TB6612_Motor_SetSpeed(0, 0);
+#endif
 }
 
 /**

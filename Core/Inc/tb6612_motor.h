@@ -12,6 +12,26 @@
 
 #include "main.h"
 
+/* ============================ 电机调试宏区（2026-08-28 抽出） ============================
+ * 实车需要调的电机参数全部集中在这里：改数值→重新编译即可，不必翻其他代码。
+ * 速度单位：占空比百分比 ±100（0=停，100=满速）。
+ * 四只直流电机精度不高、启动阈值/摩擦阻力不一致，调试顺序建议：
+ *   1) 先把 MOTOR_SPEED_CRUISE_PCT 调到车能平稳直走的最低值再+10 余量；
+ *   2) 直行跑偏用 MOTOR_TRIM_L/R_PCT 配平（偏左=左轮慢→加大 L 或减小 R）；
+ *   3) 倒车/转弯档位按手感微调。 */
+#define MOTOR_SPEED_SLOW_PCT    35   /* 后退 / 一级预警减速直行 */
+#define MOTOR_SPEED_CRUISE_PCT  50   /* 巡航直行速度 */
+#define MOTOR_SPEED_TURN_PCT    40   /* 避障转向差速 */
+#define MOTOR_SPEED_UTURN_PCT   45   /* 死胡同掉头速度 */
+#define MOTOR_TRIM_L_PCT         0   /* 左轮配平补偿：正=左轮加速 */
+#define MOTOR_TRIM_R_PCT         2   /* 右轮配平补偿：正=右轮加速 */
+
+/* 速度指令为 0 时的停机方式：
+ *   1 = 短路制动（TB6612 IN1=IN2=1，绕组短路锁轴：初始待命/停车时车体定住，
+ *       手推不动、坡道不溜车）——推荐，解决"上电电机不静止"观感；
+ *   0 = 滑行停止（IN 全 0，轮子可自由转动/手推滑行）。 */
+#define MOTOR_STOP_USE_BRAKE     1
+
 typedef enum
 {
   TB6612_MOTOR_STOP = 0,

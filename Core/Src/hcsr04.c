@@ -114,6 +114,43 @@ void HAL_TIM_IC_CaptureCallback(TIM_HandleTypeDef *htim)
   }
 }
 
+/* ============================ GPIO 轮询测距（回退方案，2026-08-28） ============================
+ * 背景：HC-SR04 的 Echo 输出为 5V 电平。PA0/PA1 对 5V 信号勉强可识别，
+ *       但 PA2/PA3 遇到超过 VDD(3.3V) 的输入会被内部钳位卡死在低电平附近，
+ *       导致 TIM5_CH3/CH4 输入捕获等不到完整边沿 → 右/后两路永远无数据。
+ * 方案：Echo 引脚本身就是 GPIO（PA0~PA3），改用 GPIO 输入读电平+DWT 计时测脉宽：
+ *       Trigger 拉高后先等回波上升沿，再计高电平宽度，30ms 超时判超量程。
+ *       此路径不依赖 TIM5 输入捕获；原捕获通道保持工作互不干扰。
+ * 注意：函数内含忙等，最坏约 30ms，仅允许在传感任务中逐帧调用。 */
+#define HCSR04_POLL_TIMEOUT_US  30000u   /* HC-SR04 最大量程回波约 25~38ms */
+
+static int32_t HCSR04_PollMeasure(HCSR04_Index_t idx)
+{
+  GPIO_TypeDef *port = GPIOA;                      /* 四路回波均在 PA0~PA3 */
+  uint16_t pin = (uint16_t)(1u << idx);
+
+  /* 等待上升沿（模块响应延迟通常 <1ms；5ms 未见回波=无模块/接线错误，及时放弃） */
+  uint32_t t0 = DWT->CYCCNT;
+  while (HAL_GPIO_ReadPin(port, pin) == GPIO_PIN_RESET)
+  {
+    if ((DWT->CYCCNT - t0) > 5u * (SystemCoreClock / 1000000u))
+    {
+      return -1;
+    }
+  }
+
+  /* 计时高电平脉宽，30ms 超时（超量程/无回波保护） */
+  t0 = DWT->CYCCNT;
+  while (HAL_GPIO_ReadPin(port, pin) == GPIO_PIN_SET)
+  {
+    if ((DWT->CYCCNT - t0) > HCSR04_POLL_TIMEOUT_US * (SystemCoreClock / 1000000u))
+    {
+      return -1;
+    }
+  }
+  return (int32_t)((DWT->CYCCNT - t0) / (SystemCoreClock / 1000000u));
+}
+
 /* ============================ 对外接口 ============================ */
 /**
  * @brief  初始化：使能 DWT 微秒延时，启动 4 路输入捕获中断
@@ -145,6 +182,16 @@ void HCSR04_Trigger(HCSR04_Index_t idx)
   HAL_GPIO_WritePin(s_trig_port[idx], s_trig_pin[idx], GPIO_PIN_SET);
   delay_us(12u);
   HAL_GPIO_WritePin(s_trig_port[idx], s_trig_pin[idx], GPIO_PIN_RESET);
+
+  /* 2026-08-28：GPIO 轮询同步完成本帧测量（绕开 PA2/PA3 捕获失效）。
+   * 捕获通道路径仍并行工作：若捕获先完成已置 HC_MEASURED，轮询读到的是
+   * 下降沿后的低电平，返回 -1，不会覆盖捕获的有效值。 */
+  int32_t us = HCSR04_PollMeasure(idx);
+  if (us >= 0)
+  {
+    s_chan[idx].width_us = (uint32_t)us;
+    s_chan[idx].state = HC_MEASURED;
+  }
 }
 
 /**

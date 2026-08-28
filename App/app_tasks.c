@@ -3,22 +3,28 @@
  * @file    app_tasks.c
  * @brief   毕设智能小车 FreeRTOS 任务框架 —— 六个任务的实现
  *
- * 【2026-08-23 重构版】预警四级（高级覆盖低级，声光显示互斥只显最高级）：
- *   一级预警 ：前超声波 <1m      → 减速；绿灯；2kHz 100ms 间歇
- *   一级警报 ：前超声波 <30cm    → 对比左右超声波转向；黄灯；3kHz 50ms 间歇
- *   2.5级    ：左前红外触发(<10cm) → 黄灯 + 2.5k 滴答变调 + 自动转向；
- *              左右后全堵=死胡同 → 掉头
- *   二级警报 ：右前红外触发(<1cm) 或 烟雾/酒精超阈值 → 红灯 + 4kHz 长鸣 +
+ * 【2026-08-28 四级预警定稿】（高级覆盖低级，声光显示互斥只显最高级）：
+ *   一级预警 ：前超声波<1m 或 视觉识别到目标(人体/车辆) 或 雷达目标(0.5m,2m]
+ *              → 减速；【绿灯，蜂鸣器静音】
+ *   二级预警 ：前超声波<30cm 或 左/右/后超声波<20cm 或 雷达距离≤0.5m
+ *              （雷达+视觉共同确认也走此档）→ 转向避让；黄灯；3kHz 50ms 间歇
+ *   三级预警 ：任一红外触发(左≈10cm/右≈1cm) → 黄灯(与二级共用)；
+ *              2.5kHz 滴答变调(频率/间歇与二级不同)；自动转向/死胡同掉头
+ *   四级警报 ：任一超声波<3cm 或 烟雾/酒精超阈值 → 红灯 + 4kHz 长鸣 +
  *              任何模式速度强制清零
- * 职责划分：超声波负责 1、2 级；左红外=2.5 级探测器(电位器≈10cm 保持现值)、
- *          右红外=3 级探测器(电位器调至最近≈1cm)。
+ * 职责划分：四路超声波全部联动——前=1/2/4级，左/右/后=2级(<20cm)/4级(<3cm)，
+ *          并参与转向选向与死胡同掉头；红外只反馈三级；
+ *          雷达/视觉=一级与二级（视觉目标或雷达(0.5,2m]→一级；雷达≤0.5m→二级）。
+ * 距离"无效值"约定：HC-SR04 超量程/无回波返回 0xFFFF，凡参与分级比较必须
+ *          先判 d<=DIST_VALID_MAX_CM，避免把无效值当 0cm 误触发四级。
  *
  * 蓝牙协议（JDY-31，USART1 9600，手机串口助手发送字符串；2026-08-24 增强）：
  *   "MA"=切模式1 → 回 "[OK] Mode1 Normal"   "MB"=切模式2 → 回 "[OK] Mode2 Fusion"
  *   "MC"=切模式3 → 回 "[OK] Mode3 Remote"   "TH"=查询温湿度 → 回 "T:26C H:55%"
  *   "W"=前进→回"[OK] FWD"  "S"=后退→回"[OK] BACK"  "A"=左转→回"[OK] LEFT"
  *   "D"=右转→回"[OK] RIGHT" "U"=掉头→回"[OK] UTURN" "X"=停止→回"[OK] STOP"
- *   未识别指令 → 回 "[ERR] Unknown"。
+ *   未识别指令 → 回 "[ERR] Unknown:xxx"（附带收到的原文便于排查）。
+ *   2026-08-28 容错：指令大小写不敏感（w 与 W 等效），帧内/帧尾空白自动忽略。
  *   每条指令收到即回传状态文本；W/S/A/D/U 在非模式3 下发会自动切到模式3 再执行，
  *   "X" 停止在任意模式下都立即生效——修复旧版"前进后退无反馈、停止按两次"的 BUG。
  *
@@ -44,33 +50,53 @@
 #include "usart.h"   /* huart1：JDY-31 蓝牙 */
 #include <string.h>
 #include <stdio.h>
+#include <stdlib.h>   /* atoi：K230 视觉行解析（2026-08-28） */
 
 /* ============================ 私有定义 ============================ */
 #define DIST_VALID_MAX_CM   300u
 
-/* 预警阈值（cm，2026-08-23 实测定稿） */
-#define TH_WARN_CM          100u  /* 一级预警：前超声波 <1m → 减速        */
-#define TH_ALARM_CM         30u   /* 一级警报：前超声波 <30cm → 转向避让  */
-/* 2.5 级 / 3 级由红外二值触发（硬件电位器定距：左≈10cm / 右≈1cm），无软件阈值 */
+/* 预警阈值（cm，2026-08-28 四级预警定稿） */
+#define TH_WARN_CM          100u  /* 一级：前超声波 <1m → 减速             */
+#define TH_ALARM_CM         30u   /* 二级：前超声波 <30cm → 转向避让        */
+#define TH_SIDE_CM          20u   /* 二级：左/右/后超声波 <20cm → 转向避让  */
+#define TH_CRITICAL_CM       3u   /* 四级：任一超声波 <3cm → 强制制动       */
+/* 三级由红外二值触发（硬件电位器定距：左≈10cm / 右≈1cm），无软件阈值 */
 #define TH_DEADEND_CM       20u   /* 死胡同判定：左/右/后均 <20cm → 掉头   */
+
+/* 雷达/视觉参数（2026-08-28 启用） */
+#define TH_RADAR_LVL1_CM    200u  /* 一级：雷达目标 ∈ (0.5m,2m]              */
+#define TH_RADAR_LVL2_CM     50u  /* 二级：雷达距离 ≤0.5m（含雷达+视觉确认） */
+#define RADAR_MAX_CM        600u  /* LD2450 量程约 6m，超此值视为无效        */
+#define RADAR_TIMEOUT_MS    800u  /* 超过该时长无雷达上报 → 目标视为离开     */
+#define VIS_TIMEOUT_MS      800u  /* 视觉目标记忆时长（目标走出画面后渐消）   */
 
 /* 直行航向修正：偏航超过该值(0.1°)开始差速修正（3° = 30） */
 #define YAW_CORRECT_TH_DEG10  30
 #define YAW_CORRECT_GAIN      5    /* 每 1° 偏航补偿 5% 差速 */
 #define YAW_CORRECT_MAX       20   /* 补偿上限 ±20% */
 
-/* 速度档（±100 占空比百分比） */
-#define SPEED_SLOW          30
-#define SPEED_CRUISE        50
-#define SPEED_TURN          40
-#define SPEED_UTURN         45
+/* 速度档（2026-08-28 统一归入 tb6612_motor.h「电机调试宏区」集中调参）：
+ * 实车调速/配平只需改 tb6612_motor.h 里的 MOTOR_*_PCT，重编译即可。 */
+#define SPEED_SLOW          MOTOR_SPEED_SLOW_PCT
+#define SPEED_CRUISE        MOTOR_SPEED_CRUISE_PCT
+#define SPEED_TURN          MOTOR_SPEED_TURN_PCT
+#define SPEED_UTURN         MOTOR_SPEED_UTURN_PCT
 
 /* ============================ 蓝牙接收（中断字节 → 环形缓冲） ============================ */
 static uint8_t  s_bt_rx_byte;                 /* 中断接收单字节缓冲 */
 static uint8_t  s_bt_ring[64];                /* 环形缓冲 */
 static volatile uint16_t s_bt_rd = 0, s_bt_wr = 0;
 
-/* UART 接收完成回调（USART1 中断上下文，优先级 5 满足 FreeRTOS 要求） */
+/* ============================ 雷达/视觉接收（同为 中断字节→环形缓冲，2026-08-28） ============================ */
+static uint8_t  s_radar_rx_byte;
+static uint8_t  s_radar_ring[160];            /* LD2450 目标帧最长 31 字节，160 足够缓冲多帧 */
+static volatile uint16_t s_radar_rd = 0, s_radar_wr = 0;
+
+static uint8_t  s_k230_rx_byte;
+static uint8_t  s_k230_ring[96];              /* K230 视觉按行上报，单行很短 */
+static volatile uint16_t s_k230_rd = 0, s_k230_wr = 0;
+
+/* UART 接收完成回调（USART1/3/6 中断上下文，优先级 5 满足 FreeRTOS 要求） */
 void HAL_UART_RxCpltCallback(UART_HandleTypeDef *huart)
 {
     if (huart->Instance == USART1) {
@@ -80,6 +106,20 @@ void HAL_UART_RxCpltCallback(UART_HandleTypeDef *huart)
             s_bt_wr = next;
         }
         HAL_UART_Receive_IT(&huart1, &s_bt_rx_byte, 1);   /* 续接下一字节 */
+    } else if (huart->Instance == USART6) {    /* LD2450 雷达 256000 */
+        uint16_t next = (uint16_t)((s_radar_wr + 1u) & 0xFFu);
+        if (next != s_radar_rd) {
+            s_radar_ring[s_radar_wr] = s_radar_rx_byte;
+            s_radar_wr = next;
+        }
+        HAL_UART_Receive_IT(&huart6, &s_radar_rx_byte, 1);
+    } else if (huart->Instance == USART3) {    /* K230 视觉 115200 */
+        uint16_t next = (uint16_t)((s_k230_wr + 1u) & 0x3Fu);
+        if (next != s_k230_rd) {
+            s_k230_ring[s_k230_wr] = s_k230_rx_byte;
+            s_k230_wr = next;
+        }
+        HAL_UART_Receive_IT(&huart3, &s_k230_rx_byte, 1);
     }
 }
 
@@ -91,27 +131,72 @@ static int Bt_RingGet(void)
     return (int)c;
 }
 
+static int Radar_RingGet(void)
+{
+    if (s_radar_rd == s_radar_wr) return -1;
+    uint8_t c = s_radar_ring[s_radar_rd];
+    s_radar_rd = (uint16_t)((s_radar_rd + 1u) & 0xFFu);
+    return (int)c;
+}
+
+static int K230_RingGet(void)
+{
+    if (s_k230_rd == s_k230_wr) return -1;
+    uint8_t c = s_k230_ring[s_k230_rd];
+    s_k230_rd = (uint16_t)((s_k230_rd + 1u) & 0x3Fu);
+    return (int)c;
+}
+
 /* ============================ 预警分级 ============================ */
+/* 超声波距离有效性：0xFFFF=超量程/无回波，必须先判 <=DIST_VALID_MAX_CM 再比较，
+ * 否则无效值会被当成 0cm 误触发四级。返回 1=有效且小于阈值。 */
+static uint8_t DistNear(uint16_t d, uint16_t th)
+{
+    return (uint8_t)((d <= DIST_VALID_MAX_CM) && (d < th));
+}
+
 /**
- * @brief  四级预警计算（超声波管 1/2 级，红外管 2.5/3 级，气体→3 级）
- * @note   只返回当前最高级；显示层互斥，低级别不再残留点亮。
+ * @brief  四级预警计算（2026-08-28 定稿，只返回当前最高级，显示层互斥）
+ *   四级：任一超声波<3cm 或 气体超标 → 红灯长鸣+强制制动
+ *   三级：任一红外触发（左≈10cm/右≈1cm）→ 黄灯滴答+自动转向
+ *   二级：前超声波<30cm 或 左/右/后<20cm 或 雷达≤0.5m → 转向避让
+ *   一级：前超声波<1m 或 视觉识别到目标 或 雷达目标∈(0.5m,2m] → 减速
  */
 static uint8_t CalcAlertLevel(const SensorData_t *s)
 {
-    /* --- 二级警报：右前红外接触(<1cm) 或 烟雾/酒精超阈值 --- */
-    if ((s->ir_right == 0u) || (s->mq2_ok == 0u) || (s->mq3_ok == 0u)) {
+    /* --- 四级警报：任一超声波 <3cm 或 烟雾/酒精超阈值 --- */
+    if (DistNear(s->dist_front_cm, TH_CRITICAL_CM) ||
+        DistNear(s->dist_left_cm,  TH_CRITICAL_CM) ||
+        DistNear(s->dist_right_cm, TH_CRITICAL_CM) ||
+        DistNear(s->dist_back_cm,  TH_CRITICAL_CM) ||
+        (s->mq2_ok == 0u) || (s->mq3_ok == 0u)) {
+        return ALERT_LEVEL4;
+    }
+
+    /* --- 三级：任一红外触发（仅红外反馈三级，不参与更高等级判定） --- */
+    if ((s->ir_left == 0u) || (s->ir_right == 0u)) {
         return ALERT_LEVEL3;
     }
-    /* --- 2.5级：左前红外触发(<10cm) → 自动转向/死胡同掉头 --- */
-    if (s->ir_left == 0u) {
-        return ALERT_LEVEL25;
-    }
-    /* --- 一级警报：前超声波 <30cm → 对比左右转向 --- */
-    if (s->dist_front_cm <= TH_ALARM_CM) {
+
+    /* --- 二级：前<30cm / 侧、后<20cm / 雷达≤0.5m（雷达+视觉共同确认同档） --- */
+    if (DistNear(s->dist_front_cm, TH_ALARM_CM) ||
+        DistNear(s->dist_left_cm,  TH_SIDE_CM) ||
+        DistNear(s->dist_right_cm, TH_SIDE_CM) ||
+        DistNear(s->dist_back_cm,  TH_SIDE_CM)) {
         return ALERT_LEVEL2;
     }
-    /* --- 一级预警：前超声波 <1m → 减速 --- */
-    if (s->dist_front_cm <= TH_WARN_CM) {
+    if (s->radar_present && (s->radar_dist_cm <= TH_RADAR_LVL2_CM)) {
+        return ALERT_LEVEL2;
+    }
+
+    /* --- 一级：前<1m / 视觉目标 / 雷达∈(0.5m,2m] --- */
+    if (DistNear(s->dist_front_cm, TH_WARN_CM)) {
+        return ALERT_LEVEL1;
+    }
+    if (s->vis_target_seen) {
+        return ALERT_LEVEL1;
+    }
+    if (s->radar_present && (s->radar_dist_cm <= TH_RADAR_LVL1_CM)) {
         return ALERT_LEVEL1;
     }
     return ALERT_NONE;
@@ -119,32 +204,37 @@ static uint8_t CalcAlertLevel(const SensorData_t *s)
 
 /* ============================ 运动规划 ============================ */
 /**
- * @brief  通用"对比左右超声波转向"（一级警报与 2.5 级共用）
+ * @brief  通用"对比左右超声波转向"（二级与三级共用）
+ * @note   侧向无效值(0xFFFF)按"开放"处理，避免单侧传感器失联导致误倒车。
  */
 static void PlanTurnBySide(const SensorData_t *s, Decision_t *out)
 {
     uint16_t dl = s->dist_left_cm, dr = s->dist_right_cm;
-    uint8_t open_l = (dl > TH_ALARM_CM);
-    uint8_t open_r = (dr > TH_ALARM_CM);
+    uint8_t open_l = (dl > TH_ALARM_CM) || (dl > DIST_VALID_MAX_CM);
+    uint8_t open_r = (dr > TH_ALARM_CM) || (dr > DIST_VALID_MAX_CM);
 
     if (open_r && !open_l)      { out->target_speed_l =  SPEED_TURN; out->target_speed_r = -SPEED_TURN; }
     else if (open_l && !open_r) { out->target_speed_l = -SPEED_TURN; out->target_speed_r =  SPEED_TURN; }
     else if (open_l && open_r)  {
-        if (dr >= dl) { out->target_speed_l = SPEED_TURN; out->target_speed_r = SPEED_SLOW; }
-        else          { out->target_speed_l = SPEED_SLOW; out->target_speed_r = SPEED_TURN; }
+        /* 两侧都开：向更宽一侧差速转（无效值视为最远，优先避开失联侧） */
+        uint16_t dlc = (dl > DIST_VALID_MAX_CM) ? 0xFFFFu : dl;
+        uint16_t drc = (dr > DIST_VALID_MAX_CM) ? 0xFFFFu : dr;
+        if (drc >= dlc) { out->target_speed_l = SPEED_TURN; out->target_speed_r = SPEED_SLOW; }
+        else            { out->target_speed_l = SPEED_SLOW; out->target_speed_r = SPEED_TURN; }
     } else                      { out->target_speed_l = -SPEED_SLOW; out->target_speed_r = -SPEED_SLOW; }
 }
 
 /**
- * @brief  2.5 级自动转向：依托左右+后超声波选向；左/右/后全堵=死胡同→掉头
+ * @brief  三级自动转向：依托四路超声波选向；左/右/后全堵=死胡同→掉头
  */
-static void PlanLevel25(const SensorData_t *s, Decision_t *out)
+static void PlanLevel3(const SensorData_t *s, Decision_t *out)
 {
     uint16_t dl = s->dist_left_cm, dr = s->dist_right_cm, db = s->dist_back_cm;
-    uint8_t open_l = (dl > TH_ALARM_CM);
-    uint8_t open_r = (dr > TH_ALARM_CM);
+    uint8_t open_l = (dl > TH_DEADEND_CM) || (dl > DIST_VALID_MAX_CM);
+    uint8_t open_r = (dr > TH_DEADEND_CM) || (dr > DIST_VALID_MAX_CM);
+    uint8_t blk_b  = (db <= TH_DEADEND_CM);   /* 后方无效(0xFFFF)不算堵 */
 
-    if (!open_l && !open_r && (db <= TH_DEADEND_CM)) {
+    if (!open_l && !open_r && blk_b) {
         /* 死胡同：原地 180° 掉头（差速旋转，靠时间完成半圈；
          * 简单可靠做法：原地旋转 1.2s，由决策层进入后持续执行） */
         out->target_speed_l =  SPEED_UTURN;
@@ -175,24 +265,29 @@ static void ApplyYawCorrection(int16_t base, Decision_t *out)
 }
 
 /**
- * @brief  模式1：普通避障运动规划
+ * @brief  模式1：普通避障运动规划（2026-08-28 四路超声波全部联动）
  */
 static void PlanModeNormal(const SensorData_t *s, Decision_t *out)
 {
     uint16_t df = s->dist_front_cm;
 
-    /* 一级警报：<30cm 对比左右转向 */
-    if (df <= TH_ALARM_CM) { PlanTurnBySide(s, out); return; }
+    /* 二级：前 <30cm → 对比左右转向 */
+    if (DistNear(df, TH_ALARM_CM)) { PlanTurnBySide(s, out); return; }
 
-    /* 一级预警：<1m 减速直行（带航向修正） */
-    if (df <= TH_WARN_CM)  { ApplyYawCorrection(SPEED_SLOW, out); return; }
-
-    /* 侧向过近轻微修偏 */
-    if ((s->dist_left_cm <= TH_ALARM_CM) && (s->dist_right_cm > s->dist_left_cm)) {
+    /* 二级联动：左/右侧 <20cm → 向另一侧修偏转向（左近偏右、右近偏左） */
+    if (DistNear(s->dist_left_cm, TH_SIDE_CM)) {
         out->target_speed_l = SPEED_CRUISE + 10; out->target_speed_r = SPEED_CRUISE - 10; return;
     }
-    if ((s->dist_right_cm <= TH_ALARM_CM) && (s->dist_left_cm > s->dist_right_cm)) {
+    if (DistNear(s->dist_right_cm, TH_SIDE_CM)) {
         out->target_speed_l = SPEED_CRUISE - 10; out->target_speed_r = SPEED_CRUISE + 10; return;
+    }
+
+    /* 一级：前 <1m → 减速直行（带航向修正） */
+    if (DistNear(df, TH_WARN_CM)) { ApplyYawCorrection(SPEED_SLOW, out); return; }
+
+    /* 后方联动：后 <20cm → 禁止倒车（低速直行拉开距离，倒车保护） */
+    if (DistNear(s->dist_back_cm, TH_SIDE_CM)) {
+        ApplyYawCorrection(SPEED_SLOW, out); return;
     }
 
     /* 巡航直行（带航向修正） */
@@ -200,13 +295,13 @@ static void PlanModeNormal(const SensorData_t *s, Decision_t *out)
 }
 
 /**
- * @brief  模式2：视觉+毫米波融合优先，无效回退模式1
+ * @brief  模式2：毫米波雷达+视觉融合优先，无效回退模式1（2026-08-28）
  */
 static void PlanModeFusion(const SensorData_t *s, Decision_t *out)
 {
     if (s->fusion_valid) {
-        if (s->fusion_dist_cm <= TH_ALARM_CM)      { PlanTurnBySide(s, out); return; }
-        if (s->fusion_dist_cm <= TH_WARN_CM + 200u) { ApplyYawCorrection(SPEED_SLOW, out); return; } /* (0.3m,3m] 减速 */
+        if (s->fusion_dist_cm <= TH_ALARM_CM)       { PlanTurnBySide(s, out); return; }
+        if (s->fusion_dist_cm <= TH_RADAR_LVL1_CM)  { ApplyYawCorrection(SPEED_SLOW, out); return; } /* (0.3m,2m] 减速 */
     }
     PlanModeNormal(s, out);
 }
@@ -221,7 +316,7 @@ void TaskSensor_Start(void *argument)
     uint32_t last_tick = osKernelGetTickCount();
 
     for (;;) {
-        /* 1. 读上一帧触发的那只超声波 */
+        /* 1. 读上一帧触发的那只超声波（Trigger 内部已同步完成测量，此处直接取值） */
         uint16_t dist = HCSR04_GetDistanceCm((HCSR04_Index_t)read_idx);
         switch (read_idx) {
             case HCSR04_FRONT: g_sensor.dist_front_cm = dist; break;
@@ -246,20 +341,44 @@ void TaskSensor_Start(void *argument)
         g_sensor.mq2_ok  = (g_sensor.mq2_raw < GAS_MQ2_THRESHOLD) ? 1u : 0u;
         g_sensor.mq3_ok  = (g_sensor.mq3_raw < GAS_MQ3_THRESHOLD) ? 1u : 0u;
 
-        /* 5. MPU6050 航向积分（20ms 一拍）；停车时自动锚定清零 */
+        /* 5. MPU6050 航向积分（2026-08-28 改异步初始化 + 失败自愈）：
+         *    - 未完成初始化时：每 500ms 重试一次 MPU6050_TaskInit()（内部先做
+         *      I2C1 总线自救再配置），成功前 mpu_ok=0，仅禁用航向修正，不影响其他功能；
+         *    - 运行中连续失败 25 帧(≈0.5s)：视为总线挂死，先总线自救再重初始化；
+         *    - 车静止（速度指令≈0）时锚定航向零点（原有逻辑保留）。 */
         {
-            int16_t yaw = 0, gz = 0;
-            if (MPU6050_Update(20, &yaw, &gz)) {
-                g_sensor.mpu_ok = 1u;
-                g_sensor.yaw_deg10 = yaw;
-                g_sensor.gz_dps10  = gz;
-                /* 车静止（速度指令≈0）时视为重新出发，锚定航向零点 */
-                if ((g_decision.target_speed_l == 0) && (g_decision.target_speed_r == 0)) {
-                    MPU6050_ResetYaw();
-                    g_sensor.yaw_deg10 = 0;
+            static uint8_t  mpu_inited   = 0u;
+            static uint32_t mpu_retry_tk = 0u;
+            static uint8_t  mpu_fail_cnt = 0u;
+            uint32_t now_tk = osKernelGetTickCount();
+
+            if (!mpu_inited) {
+                if ((now_tk - mpu_retry_tk) >= 500u) {
+                    mpu_retry_tk = now_tk;
+                    if (MPU6050_TaskInit()) {
+                        mpu_inited = 1u;
+                        g_sensor.mpu_ok = 1u;
+                    }
                 }
             } else {
-                g_sensor.mpu_ok = 0u;
+                int16_t yaw = 0, gz = 0;
+                if (MPU6050_Update(20, &yaw, &gz)) {
+                    mpu_fail_cnt = 0u;
+                    g_sensor.mpu_ok = 1u;
+                    g_sensor.yaw_deg10 = yaw;
+                    g_sensor.gz_dps10  = gz;
+                    if ((g_decision.target_speed_l == 0) && (g_decision.target_speed_r == 0)) {
+                        MPU6050_ResetYaw();
+                        g_sensor.yaw_deg10 = 0;
+                    }
+                } else {
+                    g_sensor.mpu_ok = 0u;
+                    if (++mpu_fail_cnt >= 25u) {
+                        mpu_fail_cnt = 0u;
+                        MPU6050_BusRecovery();          /* 总线自救 */
+                        mpu_inited = MPU6050_Init();    /* 重配置，失败则回到重试态 */
+                    }
+                }
             }
         }
 
@@ -333,18 +452,35 @@ void TaskDecision_Start(void *argument)
             }
         }
 
-        /* ---------- 2. K230 指令（待串口驱动） ---------- */
+        /* ---------- 2. K230 视觉消息（识别结果已由 TaskK230 直写 g_sensor，此处空转保持兼容） ---------- */
         while (osMessageQueueGet(q_k230_cmd, &cmd, NULL, 0) == osOK) { }
 
-        /* ---------- 3. 快照 + 分级（互斥：只保留最高级） ---------- */
+        /* ---------- 3. 快照 + 新鲜度管理 + 分级（互斥：只保留最高级） ---------- */
         snap = g_sensor;
+        {
+            uint32_t now_tk = osKernelGetTickCount();
+            /* 雷达：超过 RADAR_TIMEOUT_MS 无新上报 → 目标视为离开（present 清零） */
+            if ((now_tk - snap.radar_tick) >= RADAR_TIMEOUT_MS) snap.radar_present = 0u;
+            /* 视觉：目标记忆 VIS_TIMEOUT_MS 后渐消（目标走出画面不永久挂警） */
+            if ((now_tk - snap.vis_tick) >= VIS_TIMEOUT_MS)     snap.vis_target_seen = 0u;
+            /* 模式2 融合距离：雷达优先，雷达缺席用 K230 视觉上报距离兜底 */
+            if (snap.radar_present) {
+                snap.fusion_dist_cm = snap.radar_dist_cm; snap.fusion_valid = 1u;
+            } else if ((snap.vis_dist_cm <= RADAR_MAX_CM)) {
+                snap.fusion_dist_cm = snap.vis_dist_cm;   snap.fusion_valid = 1u;
+            } else {
+                snap.fusion_valid = 0u;
+            }
+            g_sensor.fusion_dist_cm = snap.fusion_dist_cm;   /* 同步回全局供显示层 */
+            g_sensor.fusion_valid   = snap.fusion_valid;
+        }
         g_decision.alert_level = CalcAlertLevel(&snap);
 
         /* 模式2 融合叠加（只升不降） */
         if ((g_decision.mode == MODE_FUSION) && (snap.fusion_valid)) {
             if ((snap.fusion_dist_cm <= TH_ALARM_CM) && (g_decision.alert_level < ALERT_LEVEL2))
                 g_decision.alert_level = ALERT_LEVEL2;
-            else if ((snap.fusion_dist_cm <= 300u) && (g_decision.alert_level < ALERT_LEVEL1))
+            else if ((snap.fusion_dist_cm <= TH_RADAR_LVL1_CM) && (g_decision.alert_level < ALERT_LEVEL1))
                 g_decision.alert_level = ALERT_LEVEL1;
         }
 
@@ -361,13 +497,13 @@ void TaskDecision_Start(void *argument)
         default: g_decision.mode = MODE_NORMAL; break;
         }
 
-        /* ---------- 5. 2.5 级：自动转向/死胡同掉头（覆盖当前规划） ---------- */
-        if (g_decision.alert_level == ALERT_LEVEL25) {
-            PlanLevel25(&snap, &g_decision);
+        /* ---------- 5. 三级：红外触发自动转向/死胡同掉头（覆盖当前规划） ---------- */
+        if (g_decision.alert_level == ALERT_LEVEL3) {
+            PlanLevel3(&snap, &g_decision);
         }
 
-        /* ---------- 6. 二级警报：任何模式强制清零 ---------- */
-        if (g_decision.alert_level == ALERT_LEVEL3) {
+        /* ---------- 6. 四级警报：任何模式（含蓝牙遥控）强制清零 ---------- */
+        if (g_decision.alert_level == ALERT_LEVEL4) {
             g_decision.target_speed_l = 0;
             g_decision.target_speed_r = 0;
         }
@@ -388,10 +524,18 @@ void TaskMotor_Start(void *argument)
     (void)argument;
     for (;;) {
         if (g_decision.motor_enabled) {
-            TB6612_Motor_SetSpeedPercent(g_decision.target_speed_l,
-                                         g_decision.target_speed_r);
+            /* 2026-08-28：左右轮配平补偿（MOTOR_TRIM_L/R_PCT），
+             * 抵消四只电机启动阈值/摩擦不一致导致的直行跑偏；
+             * 仅在行驶速度上叠加，±100 限幅。 */
+            int16_t tl = (int16_t)(g_decision.target_speed_l + MOTOR_TRIM_L_PCT);
+            int16_t tr = (int16_t)(g_decision.target_speed_r + MOTOR_TRIM_R_PCT);
+            if (tl >  100) tl =  100;
+            if (tl < -100) tl = -100;
+            if (tr >  100) tr =  100;
+            if (tr < -100) tr = -100;
+            TB6612_Motor_SetSpeedPercent(tl, tr);
         } else {
-            TB6612_Motor_Stop();
+            TB6612_Motor_Stop();   /* 未预热/未使能=刹车定住，上电即静止 */
         }
         osDelay(10);
     }
@@ -424,12 +568,23 @@ void TaskBt_Start(void *argument)
         if (c >= 0) {
             last_byte_tick = osKernelGetTickCount();
             if ((char)c != '\r' && (char)c != '\n') {
-                if (len < (uint8_t)(sizeof(line) - 1u)) line[len++] = (char)c;
+                /* 2026-08-28：同时丢弃空格/制表符（手机端可能附带），
+                 * 避免 "W " / " w" 这类脏帧被误判为 Unknown */
+                if ((char)c == ' ' || (char)c == '\t') { /* 忽略 */ }
+                else if (len < (uint8_t)(sizeof(line) - 1u)) line[len++] = (char)c;
             }
         } else {
             /* 30ms 无新字节视为一帧结束 */
             if ((len > 0u) && ((osKernelGetTickCount() - last_byte_tick) >= 30u)) {
                 line[len] = '\0';
+                /* 2026-08-28：容错处理（修复"只有 MC/TH 正常、其余全回 ERR"）：
+                 *  1) 去掉末尾残留空白；
+                 *  2) 全部转大写再匹配——手机端发 "w"/"W" 均识别，
+                 *     大小写差异是单字母指令误判 Unknown 的最常见原因。 */
+                while ((len > 0u) && ((line[len-1u] == ' ') || (line[len-1u] == '\t'))) { len--; line[len] = '\0'; }
+                for (uint8_t ui = 0u; ui < len; ui++) {
+                    if ((line[ui] >= 'a') && (line[ui] <= 'z')) line[ui] = (char)(line[ui] - 'a' + 'A');
+                }
                 AppCmd_t cmd = {0};
                 uint8_t hit = 1u;
                 /* 2026-08-24 重构：
@@ -471,13 +626,128 @@ void TaskBt_Start(void *argument)
     }
 }
 
-/* ============================ 任务5：K230 通信 ============================ */
+/* ============================ 任务5：K230 视觉通信（2026-08-28 实现） ============================
+ * 协议约定（ASCII 行，USART3 115200，K230 端按此格式输出即可对接）：
+ *   "PERSON"            → 识别到人体（无距离）
+ *   "CAR"               → 识别到车辆（无距离）
+ *   "PERSON,52"         → 识别到人体，目标距离 52cm（K230 侧估计/测距）
+ *   "CAR,80"            → 识别到车辆，目标距离 80cm
+ *   其余行忽略。行以 '\r' 或 '\n' 结束。
+ * 作用：vis_target_seen 参与一级预警；vis_dist_cm 在模式2雷达缺席时兜底融合。 */
+static void K230_ParseLine(const char *line)
+{
+    uint8_t  is_person = (strncmp(line, "PERSON", 6u) == 0);
+    uint8_t  is_car    = (strncmp(line, "CAR", 3u) == 0);
+    uint16_t dist = 0xFFFFu;
+
+    if (!is_person && !is_car) return;
+
+    /* 可选 ",距离" 后缀（cm） */
+    const char *comma = strchr(line, ',');
+    if (comma != NULL) {
+        int d = atoi(comma + 1);
+        if ((d > 0) && (d <= (int)RADAR_MAX_CM)) dist = (uint16_t)d;
+    }
+
+    g_sensor.vis_target_seen = 1u;
+    g_sensor.vis_tick        = osKernelGetTickCount();
+    g_sensor.vis_dist_cm     = dist;
+}
+
 void TaskK230_Start(void *argument)
 {
     (void)argument;
+    static char line[32];
+    uint8_t len = 0u;
+
+    HAL_UART_Receive_IT(&huart3, &s_k230_rx_byte, 1);   /* 启动中断接收 */
+
     for (;;) {
-        /* TODO(串口驱动): IDLE+DMA 收帧后 osMessageQueuePut(q_k230_cmd,...) */
-        osDelay(10);
+        int c = K230_RingGet();
+        if (c >= 0) {
+            if ((c == '\r') || (c == '\n')) {
+                if (len > 0u) { line[len] = '\0'; K230_ParseLine(line); len = 0u; }
+            } else if (len < (uint8_t)(sizeof(line) - 1u)) {
+                line[len++] = (char)c;
+            }
+        } else {
+            osDelay(10);
+        }
+    }
+}
+
+/* ============================ 任务7：LD2450 毫米波雷达（2026-08-28 实现） ============================
+ * 协议：出厂默认"工程模式"，USART6 256000 8N1，持续上报多种帧；
+ * 本任务只解析【目标数据帧】：
+ *   帧头 0x55 0xAA 0x03 | 数据长度(2B 小端,=8×目标数) | N×8字节目标 | 帧尾 0x55 0xCC
+ *   每个目标 8 字节：X坐标(2B,有符号,-240~240cm) | Y坐标(2B,0~600cm,正前方距离)
+ *                   | 速度(2B,有符号,±127cm/s)   | 距离分辨率(2B,mm)
+ *   X=Y=速度=分辨率全0 = 空目标（无有效目标），跳过。
+ * 作用：取最近目标距离 radar_dist_cm；≤0.5m→二级，(0.5,2]m→一级；
+ *       超过 RADAR_TIMEOUT_MS 无新帧视为目标离开（决策层清零）。 */
+typedef enum {
+    RD_WAIT_55 = 0, RD_WAIT_AA, RD_WAIT_03, RD_LEN_LO, RD_LEN_HI, RD_DATA, RD_TAIL_55, RD_TAIL_CC
+} RadarParseState_t;
+
+static void Radar_ParseTargets(const uint8_t *data, uint16_t len)
+{
+    uint16_t min_dist = 0xFFFFu;
+    uint8_t  has_target = 0u;
+    uint16_t i;
+
+    for (i = 0u; (i + 8u) <= len; i = (uint16_t)(i + 8u)) {
+        int16_t  x   = (int16_t)(uint16_t)(data[i] | ((uint16_t)data[i + 1u] << 8));
+        uint16_t y   = (uint16_t)(data[i + 2u] | ((uint16_t)data[i + 3u] << 8));
+        int16_t  v   = (int16_t)(uint16_t)(data[i + 4u] | ((uint16_t)data[i + 5u] << 8));
+        uint16_t res = (uint16_t)(data[i + 6u] | ((uint16_t)data[i + 7u] << 8));
+
+        if ((x == 0) && (y == 0u) && (v == 0) && (res == 0u)) continue;  /* 空目标 */
+        has_target = 1u;
+        if (y < min_dist) min_dist = y;   /* 取所有目标中最近的一个 */
+    }
+
+    if (has_target && (min_dist <= RADAR_MAX_CM)) {
+        g_sensor.radar_present = 1u;
+        g_sensor.radar_dist_cm = min_dist;
+        g_sensor.radar_tick    = osKernelGetTickCount();
+    }
+}
+
+void TaskRadar_Start(void *argument)
+{
+    (void)argument;
+    static uint8_t frame[32];           /* 目标数据最多 3×8=24 字节 */
+    static RadarParseState_t st = RD_WAIT_55;
+    static uint16_t need = 0, got = 0;
+
+    HAL_UART_Receive_IT(&huart6, &s_radar_rx_byte, 1);   /* 启动中断接收 */
+
+    for (;;) {
+        int c = Radar_RingGet();
+        if (c < 0) { osDelay(5); continue; }
+        uint8_t b = (uint8_t)c;
+
+        switch (st) {
+        case RD_WAIT_55: if (b == 0x55u) st = RD_WAIT_AA;               break;
+        case RD_WAIT_AA: st = (b == 0xAAu) ? RD_WAIT_03 : ((b == 0x55u) ? RD_WAIT_AA : RD_WAIT_55); break;
+        case RD_WAIT_03: st = (b == 0x03u) ? RD_LEN_LO : ((b == 0x55u) ? RD_WAIT_AA : RD_WAIT_55); break;
+        case RD_LEN_LO:  need = b; st = RD_LEN_HI;                       break;
+        case RD_LEN_HI:
+            need = (uint16_t)(need | ((uint16_t)b << 8));
+            if ((need == 0u) || (need > 24u)) { st = RD_WAIT_55; }        /* 长度非法丢帧 */
+            else { got = 0u; st = RD_DATA; }
+            break;
+        case RD_DATA:
+            frame[got++] = b;
+            if (got >= need) st = RD_TAIL_55;
+            break;
+        case RD_TAIL_55: st = (b == 0x55u) ? RD_TAIL_CC : RD_WAIT_55; break;
+        case RD_TAIL_CC:
+            if (b == 0xCCu) Radar_ParseTargets(frame, need);              /* 帧完整，解析 */
+            st = RD_WAIT_55;
+            break;
+        default: st = RD_WAIT_55; break;
+        }
     }
 }
 
@@ -501,30 +771,33 @@ void TaskDisplay_Start(void *argument)
 
         uint8_t lv = g_decision.alert_level;
 
-        /* --- LED 互斥：只点亮当前最高级对应灯（灌电流：低电平点亮） --- */
+        /* --- LED 互斥（2026-08-28 四级规则）：
+         *   一级=绿灯；二级与三级共用黄灯；四级=红灯；无预警全灭（灌电流低电平点亮） --- */
         HAL_GPIO_WritePin(LED_G_GPIO_Port, LED_G_Pin, (lv == ALERT_LEVEL1) ? GPIO_PIN_RESET : GPIO_PIN_SET);
         HAL_GPIO_WritePin(LED_Y_GPIO_Port, LED_Y_Pin,
-            ((lv == ALERT_LEVEL2) || (lv == ALERT_LEVEL25)) ? GPIO_PIN_RESET : GPIO_PIN_SET);
-        HAL_GPIO_WritePin(LED_R_GPIO_Port, LED_R_Pin, (lv == ALERT_LEVEL3) ? GPIO_PIN_RESET : GPIO_PIN_SET);
+            ((lv == ALERT_LEVEL2) || (lv == ALERT_LEVEL3)) ? GPIO_PIN_RESET : GPIO_PIN_SET);
+        HAL_GPIO_WritePin(LED_R_GPIO_Port, LED_R_Pin, (lv == ALERT_LEVEL4) ? GPIO_PIN_RESET : GPIO_PIN_SET);
 
-        /* --- 蜂鸣器分档（频率由低到高）：1=2k间歇 2=3k间歇 2.5=2.5k滴答 3=4k长鸣 --- */
+        /* --- 蜂鸣器分档（四级规则）：
+         *   一级=静音（仅绿灯）；二级=3kHz 50ms间歇；三级=2.5kHz 滴答变调（与二级区分）；
+         *   四级=4kHz 长鸣 --- */
         static uint8_t tick_cnt = 0;
         tick_cnt = (uint8_t)((tick_cnt + 1u) & 0x0Fu);
         switch (lv) {
-            case ALERT_LEVEL1:   /* 100ms 响 / 100ms 停（50ms 一拍×2） */
-                if (tick_cnt & 0x02u) Beep_SetFreq(BEEP_FREQ_LEVEL1_HZ); else Beep_Off();
+            case ALERT_LEVEL1:   /* 一级：只亮绿灯，蜂鸣器静音 */
+                Beep_Off();
                 break;
-            case ALERT_LEVEL2:   /* 50ms 响 / 50ms 停 */
+            case ALERT_LEVEL2:   /* 二级：3kHz，50ms 响 / 50ms 停 */
                 if (tick_cnt & 0x01u) Beep_SetFreq(BEEP_FREQ_LEVEL2_HZ); else Beep_Off();
                 break;
-            case ALERT_LEVEL25:  /* 滴答变调：2.5k 与 2k 交替短音 */
+            case ALERT_LEVEL3:   /* 三级：滴答变调，2.5k 与 2k 交替短音（间歇节奏与二级不同） */
                 if (tick_cnt & 0x04u) {
                     Beep_SetFreq((tick_cnt & 0x02u) ? BEEP_FREQ_LEVEL25_HZ : BEEP_FREQ_LEVEL1_HZ);
                 } else {
                     Beep_Off();
                 }
                 break;
-            case ALERT_LEVEL3:   /* 长鸣 */
+            case ALERT_LEVEL4:   /* 四级：4kHz 长鸣 */
                 Beep_SetFreq(BEEP_FREQ_LEVEL3_HZ);
                 break;
             default:
@@ -533,19 +806,19 @@ void TaskDisplay_Start(void *argument)
         }
 
         /* --- OLED 布局（64px 高，混排字体，5 行） ---
-         * y0  (6x8)  模式+当前等级+温湿度：M:1 L:2.5 T:26C H:55
+         * y0  (6x8)  模式+当前等级+温湿度：M:1 L:2 T:26C H:55
          * y8  (8x16) 前/左距离
          * y24 (8x16) 右/后距离
-         * y40 (6x8)  气体状态+航向角
-         * y48 (6x8)  最下排：ALARM 触发串（1/2/2.5/3 并排显示） */
+         * y40 (6x8)  气体状态+雷达距离（2026-08-28 航向角行让位给雷达，R:--=无目标）
+         * y48 (6x8)  最下排：ALARM 触发源串（1/2/3/4 并排显示） */
         char buf[28];
-        const char *lv_str = (lv == ALERT_NONE)   ? "L:0  " :
-                             (lv == ALERT_LEVEL1) ? "L:1  " :
-                             (lv == ALERT_LEVEL2) ? "L:2  " :
-                             (lv == ALERT_LEVEL25)? "L:2.5" : "L:3  ";
+        const char *lv_str = (lv == ALERT_NONE)   ? "L:0 " :
+                             (lv == ALERT_LEVEL1) ? "L:1 " :
+                             (lv == ALERT_LEVEL2) ? "L:2 " :
+                             (lv == ALERT_LEVEL3) ? "L:3 " : "L:4 ";
         snprintf(buf, sizeof(buf), "M:%u %s T:%dC H:%u",
                  g_decision.mode, lv_str, (int)g_sensor.temp_c, g_sensor.humi_pct);
-        OLED_ShowString(0, 0, "                     ", OLED_6X8);
+        OLED_ShowString(0, 0, "                       ", OLED_6X8);
         OLED_ShowString(0, 0, buf, OLED_6X8);
 
         OLED_ShowString(0, 8,  "F:", OLED_8X16);  OLED_ShowDistCm(16, 8,  g_sensor.dist_front_cm);
@@ -553,23 +826,35 @@ void TaskDisplay_Start(void *argument)
         OLED_ShowString(0, 24, "R:", OLED_8X16);  OLED_ShowDistCm(16, 24, g_sensor.dist_right_cm);
         OLED_ShowString(64, 24,"B:", OLED_8X16);  OLED_ShowDistCm(80, 24, g_sensor.dist_back_cm);
 
-        snprintf(buf, sizeof(buf), "Q2:%s Q3:%s Y:%d.%d",
-                 g_sensor.mq2_ok ? "OK" : "ER",
-                 g_sensor.mq3_ok ? "OK" : "ER",
-                 (int)(g_sensor.yaw_deg10 / 10),
-                 (int)((g_sensor.yaw_deg10 < 0 ? -g_sensor.yaw_deg10 : g_sensor.yaw_deg10) % 10));
+        {
+            char rstr[8];
+            if (g_sensor.radar_present) snprintf(rstr, sizeof(rstr), "%u", (unsigned)g_sensor.radar_dist_cm);
+            else                        snprintf(rstr, sizeof(rstr), "--");
+            snprintf(buf, sizeof(buf), "Q2:%s Q3:%s R:%s",
+                     g_sensor.mq2_ok ? "OK" : "ER",
+                     g_sensor.mq3_ok ? "OK" : "ER",
+                     rstr);
+        }
         OLED_ShowString(0, 40, "                     ", OLED_6X8);
         OLED_ShowString(0, 40, buf, OLED_6X8);
 
-        /* 最下排：触发的一、二级警报并排打印（用户要求） */
+        /* 最下排：当前所有处于触发状态的预警档位并排打印（1/2/3/4） */
         {
-            uint16_t df = g_sensor.dist_front_cm;
             char l3[20];
             l3[0] = '\0';
-            if (df <= TH_WARN_CM)  strcat(l3, "1 ");
-            if (df <= TH_ALARM_CM) strcat(l3, "2 ");
-            if (g_sensor.ir_left == 0u)  strcat(l3, "2.5 ");
-            if (lv == ALERT_LEVEL3)      strcat(l3, "3 ");
+            if (DistNear(g_sensor.dist_front_cm, TH_WARN_CM) || g_sensor.vis_target_seen ||
+                (g_sensor.radar_present && (g_sensor.radar_dist_cm <= TH_RADAR_LVL1_CM))) strcat(l3, "1 ");
+            if (DistNear(g_sensor.dist_front_cm, TH_ALARM_CM) ||
+                DistNear(g_sensor.dist_left_cm,  TH_SIDE_CM)  ||
+                DistNear(g_sensor.dist_right_cm, TH_SIDE_CM)  ||
+                DistNear(g_sensor.dist_back_cm,  TH_SIDE_CM)  ||
+                (g_sensor.radar_present && (g_sensor.radar_dist_cm <= TH_RADAR_LVL2_CM))) strcat(l3, "2 ");
+            if ((g_sensor.ir_left == 0u) || (g_sensor.ir_right == 0u)) strcat(l3, "3 ");
+            if (DistNear(g_sensor.dist_front_cm, TH_CRITICAL_CM) ||
+                DistNear(g_sensor.dist_left_cm,  TH_CRITICAL_CM) ||
+                DistNear(g_sensor.dist_right_cm, TH_CRITICAL_CM) ||
+                DistNear(g_sensor.dist_back_cm,  TH_CRITICAL_CM) ||
+                (g_sensor.mq2_ok == 0u) || (g_sensor.mq3_ok == 0u)) strcat(l3, "4 ");
             snprintf(buf, sizeof(buf), "ALARM:%-13s", (l3[0] ? l3 : "--"));
             OLED_ShowString(0, 48, "                     ", OLED_6X8);
             OLED_ShowString(0, 48, buf, OLED_6X8);

@@ -73,3 +73,58 @@ void MPU6050_ResetYaw(void)
 {
     s_yaw_deg10 = 0;
 }
+
+/**
+ * @brief  I2C1 总线自救：9 个 SCL 脉冲 + 手动 STOP + 外设重建
+ * @note   与 OLED.c 的 OLED_I2C_BusRecovery 同一套路（2026-08-28 同步引入）：
+ *         把 PB6/PB7 临时切普通开漏 GPIO，手动拨 9 个 SCL 脉冲让挂死的从机
+ *         吐完剩余位、释放 SDA；再拉高 SDA 补一个 STOP 条件；最后
+ *         DeInit/Init 重建 I2C1 外设，清掉 BUSY/ERR 状态。
+ *         典型触发场景：按键复位瞬间 MPU6050 正在应答，SDA 残留低电平。
+ */
+void MPU6050_BusRecovery(void)
+{
+    GPIO_InitTypeDef gi = {0};
+
+    /* 1) PB6/PB7 切普通开漏输出，CPU 手动接管总线 */
+    gi.Mode  = GPIO_MODE_OUTPUT_OD;
+    gi.Pull  = GPIO_PULLUP;
+    gi.Speed = GPIO_SPEED_FREQ_LOW;
+    gi.Pin   = GPIO_PIN_6;
+    HAL_GPIO_Init(GPIOB, &gi);
+    gi.Pin = GPIO_PIN_7;
+    HAL_GPIO_Init(GPIOB, &gi);
+
+    HAL_GPIO_WritePin(GPIOB, GPIO_PIN_6, GPIO_PIN_SET);  /* SCL 空闲高 */
+    HAL_GPIO_WritePin(GPIOB, GPIO_PIN_7, GPIO_PIN_SET);  /* 尝试释放 SDA */
+
+    /* 2) 9 个 SCL 脉冲：从机最多还欠 9 个时钟位，拨满即释放 SDA */
+    for (uint8_t i = 0u; i < 9u; i++) {
+        HAL_GPIO_WritePin(GPIOB, GPIO_PIN_6, GPIO_PIN_RESET);
+        for (volatile uint16_t d = 0u; d < 50u; d++) { __NOP(); }
+        HAL_GPIO_WritePin(GPIOB, GPIO_PIN_6, GPIO_PIN_SET);
+        for (volatile uint16_t d = 0u; d < 50u; d++) { __NOP(); }
+    }
+
+    /* 3) 手动 STOP：SCL 高期间 SDA 低→高 */
+    HAL_GPIO_WritePin(GPIOB, GPIO_PIN_7, GPIO_PIN_RESET);
+    for (volatile uint16_t d = 0u; d < 50u; d++) { __NOP(); }
+    HAL_GPIO_WritePin(GPIOB, GPIO_PIN_6, GPIO_PIN_SET);
+    for (volatile uint16_t d = 0u; d < 50u; d++) { __NOP(); }
+    HAL_GPIO_WritePin(GPIOB, GPIO_PIN_7, GPIO_PIN_SET);
+    for (volatile uint16_t d = 0u; d < 50u; d++) { __NOP(); }
+
+    /* 4) 外设重建：清 BUSY/ERR 状态，恢复 AF 复用由 MspInit 重配 */
+    HAL_I2C_DeInit(&hi2c1);
+    HAL_I2C_Init(&hi2c1);
+}
+
+/**
+ * @brief  任务上下文初始化：先自救总线，再发配置序列
+ * @retval 1=成功 0=失败（调用方稍后重试即可，不阻塞系统）
+ */
+uint8_t MPU6050_TaskInit(void)
+{
+    MPU6050_BusRecovery();
+    return MPU6050_Init();
+}

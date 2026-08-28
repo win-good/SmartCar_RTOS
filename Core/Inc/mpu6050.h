@@ -35,4 +35,18 @@ uint8_t MPU6050_Update(uint32_t dt_ms, int16_t *out_yaw_deg10, int16_t *out_gz_d
  */
 void MPU6050_ResetYaw(void);
 
+/**
+ * @brief  I2C1 总线自救（2026-08-28 新增，OLED.c 同款 9 脉冲方案）
+ * @note   复位瞬间 SDA 可能被从机拉死 → I2C1 BUSY → 所有事务失败。
+ *         拨 9 个 SCL 脉冲逼从机释放 SDA + 手动 STOP + 外设 DeInit/Init。
+ *         供传感任务在 MPU 连续失败时调用。
+ */
+void MPU6050_BusRecovery(void);
+
+/**
+ * @brief  任务上下文初始化（2026-08-28 新增）
+ * @note   先做总线自救再发配置序列；失败不阻塞，返回 0 由调用方周期重试。
+ */
+uint8_t MPU6050_TaskInit(void);
+
 #endif /* __MPU6050_H */

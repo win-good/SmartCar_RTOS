@@ -27,6 +27,7 @@ osThreadId_t t_decision = NULL;
 osThreadId_t t_motor    = NULL;
 osThreadId_t t_bt       = NULL;
 osThreadId_t t_k230     = NULL;
+osThreadId_t t_radar    = NULL;   /* LD2450 雷达（2026-08-28 新增） */
 osThreadId_t t_display  = NULL;
 
 /* 任务入口函数声明（实现见 app_tasks.c） */
@@ -35,6 +36,7 @@ extern void TaskDecision_Start(void *argument);
 extern void TaskMotor_Start(void *argument);
 extern void TaskBt_Start(void *argument);
 extern void TaskK230_Start(void *argument);
+extern void TaskRadar_Start(void *argument);
 extern void TaskDisplay_Start(void *argument);
 
 /* ============================ 初始化 ============================ */
@@ -52,6 +54,12 @@ void App_Init(void)
     g_sensor.dist_back_cm  = 0xFFFF;
     g_sensor.ir_left       = 1;   /* 默认无障碍 */
     g_sensor.ir_right      = 1;
+    g_sensor.radar_present = 0;   /* 雷达默认无目标 */
+    g_sensor.radar_dist_cm = 0xFFFF;
+    g_sensor.vis_target_seen = 0; /* 视觉默认无目标 */
+    g_sensor.vis_dist_cm   = 0xFFFF;  /* 【必须0xFFFF】0 会被当成"距离0cm"误触发四级 */
+    g_sensor.fusion_dist_cm = 0xFFFF;
+    g_sensor.fusion_valid  = 0;
     g_sensor.update_tick   = 0;
 
     g_decision.mode          = MODE_NORMAL;  /* 上电默认：普通避障模式 */
@@ -94,6 +102,15 @@ void App_Init(void)
         .priority = (osPriority_t)osPriorityNormal,
     };
     t_k230 = osThreadNew(TaskK230_Start, NULL, &attr_k230);
+
+    /* LD2450 毫米波雷达任务（2026-08-28 新增）：
+     * USART6 256000 中断接收 → 解析目标帧 → 写 g_sensor.radar_*；
+     * 雷达数据只参与预警分级与模式2融合，不直接驱动电机。 */
+    const osThreadAttr_t attr_radar = {
+        .name = "TaskRadar", .stack_size = 512 * 4,
+        .priority = (osPriority_t)osPriorityNormal,
+    };
+    t_radar = osThreadNew(TaskRadar_Start, NULL, &attr_radar);
 
     const osThreadAttr_t attr_display = {
         .name = "TaskDisplay", .stack_size = 512 * 4,
