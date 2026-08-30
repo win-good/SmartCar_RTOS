@@ -10,7 +10,7 @@
  *   二级预警(ALERT_LEVEL2)：前超声波<30cm 或 侧/后超声波<20cm
  *                         或 雷达距离≤0.5m(含雷达+视觉共同确认) → 转向避让；
  *                         黄灯；3kHz 50ms 间歇
- *   三级预警(ALERT_LEVEL3)：任一红外触发(左≈10cm/右≈1cm) → 黄灯(与2级共用)；
+ *   三级预警(ALERT_LEVEL3)：任一红外触发(左/右电位器均调至约10cm) → 黄灯(与2级共用)；
  *                         2.5kHz 滴答变调(频率/间歇与2级不同)；自动转向/死胡同掉头
  *   四级警报(ALERT_LEVEL4)：任一超声波<3cm 或 烟雾/酒精超阈值
  *                         → 红灯 + 4kHz 长鸣 + 任何模式速度强制清零
@@ -36,7 +36,7 @@ extern "C" {
 /* ============================ 引脚宏映射 ============================
  * CubeMX main.h 采用板级丝印命名，此层映射为语义命名，便于任务代码阅读。
  *   HCSR04Q/Z/Y/H = 前/左/右/后 超声波 Trig（PE2~PE5）
- *   HW01Z=左前红外(三级探测器,电位器≈10cm)  HW01Y=右前红外(三级探测器,电位器≈1cm)
+ *   HW01Z=左前红外(三级探测器,电位器≈10cm)  HW01Y=右前红外(三级探测器,电位器≈10cm)
  *   LED2(PE14)=绿/一级  LED3(PE15)=黄/二级与三级  LED1(PB5)=红/四级
  * 若日后在 CubeMX 中把 Label 直接改成语义名并重新生成，可删除本映射块。 */
 #define Trig_F_Pin        HCSR04Q_Pin
@@ -80,8 +80,8 @@ typedef struct {
     uint16_t dist_left_cm;
     uint16_t dist_right_cm;
     uint16_t dist_back_cm;
-    uint8_t  ir_left;          /* 左前红外(2.5级探测器)：0=障碍<10cm  1=无障碍 */
-    uint8_t  ir_right;         /* 右前红外(3级探测器) ：0=障碍<1cm   1=无障碍 */
+    uint8_t  ir_left;          /* 左前红外(三级探测器,电位器≈10cm)：0=有障碍  1=无障碍 */
+    uint8_t  ir_right;         /* 右前红外(三级探测器,电位器≈10cm)：0=有障碍  1=无障碍 */
     int16_t  yaw_deg10;        /* MPU6050 累积航向角 ×10（互补滤波，°×10） */
     int16_t  gz_dps10;         /* MPU6050 Z 轴角速度 ×10（°/s ×10） */
     uint8_t  mpu_ok;           /* MPU6050 通信：1=正常 0=异常 */
@@ -100,7 +100,7 @@ typedef struct {
     uint8_t  vis_target_seen;  /* 1=视觉识别到目标（人体或车辆） */
     uint32_t vis_tick;         /* 视觉最近一次识别到目标的 tick（超时自动清零） */
     uint16_t vis_dist_cm;      /* K230 上报的目标距离（cm），0xFFFF=未提供/无效 */
-    /* ---- 模式2 融合距离：雷达距离为主（K230 视觉暂不输出距离） ---- */
+    /* ---- 模式2 融合距离：雷达距离优先，K230 视觉上报距离兜底（决策任务刷新） ---- */
     uint16_t fusion_dist_cm;   /* 决策任务用雷达+视觉刷新（cm），0xFFFF=无效 */
     uint8_t  fusion_valid;     /* 融合距离有效标志（决策任务写入） */
     uint32_t update_tick;      /* 最近一次更新的系统 tick，供数据新鲜度判断 */
@@ -116,6 +116,7 @@ typedef struct {
     int16_t  rc_speed_l;       /* 模式3 蓝牙遥控目标速度（TaskBt/Decision 写入） */
     int16_t  rc_speed_r;
     uint8_t  rc_active;        /* 1=本周期内有遥控指令（模式3 才使用） */
+    uint8_t  moving;           /* 1=运动中（2026-08-29：静止时超声波/红外不参与，方便调试） */
 } Decision_t;
 
 /* 蓝牙/K230 解析后的指令（队列元素） */
@@ -134,14 +135,13 @@ typedef struct {
 #define BT_CMD_TURNR      0x13u  /* "D"  → 遥控右转 */
 #define BT_CMD_UTURN      0x14u  /* "U"  → 遥控掉头 */
 #define BT_CMD_STOP       0x15u  /* "X"  → 遥控停止 */
-#define BT_CMD_TH_QUERY   0x20u  /* "TH" → 查询温湿度（板端回传） */
+/* 说明：TH / GAS 查询由 TaskBt 直接回传，不入队列，无指令码 */
 
 /* ============================ 全局实例（extern） ============================ */
 extern SensorData_t g_sensor;
 extern Decision_t   g_decision;
 
 extern osMessageQueueId_t q_bt_cmd;   /* 蓝牙指令队列（TaskBt  → TaskDecision） */
-extern osMessageQueueId_t q_k230_cmd; /* K230 视觉消息队列（TaskK230 → TaskDecision） */
 
 /* ============================ 任务句柄（extern） ============================ */
 extern osThreadId_t t_sensor;    /* 传感采集 */
@@ -157,7 +157,7 @@ void App_Init(void);   /* 创建全部队列与任务，在 MX_FREERTOS_Init() �
 
 /* 独立看门狗（2026-08-24 新增）：
  *   App_Watchdog_Init  在 main() 的 HAL_Init 之后尽早调用（IWDG 用 LSI 独立时钟，
- *                      不依赖系统时钟是否配置成功），超时约 2.7s，一次启动不可关闭；
+ *                      不依赖系统时钟是否配置成功），超时 20s（需覆盖最坏初始化耗时），一次启动不可关闭；
  *   App_Watchdog_Feed  由 TaskDisplay 每 50ms 喂一次。任何任务死锁/死循环/跑飞
  *                      导致停喂，看门狗自动整机复位恢复——"复位后偶发无响应只能
  *                      断电恢复"从此变为自动恢复。 */

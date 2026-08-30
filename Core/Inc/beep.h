@@ -9,9 +9,14 @@
  * 极性约定（低电平触发模块）：
  *          静默 = PD12 常高（CH1 配 PWM 模式2 + CCR=0 实现，模块未触发）；
  *          发声 = 50% 方波（CCR=ARR/2，模块内部反相后仍是方波，无源正常响）。
- * 分档发声频率（对应三级预警"蜂鸣器频率由低到高"）：
- *          一级预警 2kHz（低频）、一级警报 3kHz、2.5档 2.5kHz 滴答音、
- *          二级警报 4kHz 长鸣。无源蜂鸣器谐振多在 2~4kHz，响亮可闻。
+ *
+ * 【2026-08-29 四级预警分档定名】（原三级时代命名已清理，避免误导）：
+ *          一级预警：静音（仅绿灯，不响）
+ *          二级预警：3kHz 间歇（50ms 响 / 50ms 停）        → BEEP_FREQ_LVL2_HZ
+ *          三级预警：滴答变调（2.5kHz 与 2kHz 交替短音，
+ *                    节奏与二级明显区分）                   → BEEP_FREQ_LVL3A_HZ / BEEP_FREQ_LOW_HZ
+ *          四级警报：4kHz 长鸣                              → BEEP_FREQ_LVL4_HZ
+ *          无源蜂鸣器谐振多在 2~4kHz，以上频段响亮可闻。
  ******************************************************************************
  */
 #ifndef __BEEP_H
@@ -28,11 +33,11 @@
 #define BEEP_GPIO_CLK_EN __HAL_RCC_GPIOD_CLK_ENABLE
 #define BEEP_AF         GPIO_AF2_TIM4   /* PD12 的 TIM4_CH1 复用 = AF2 */
 
-/* 各级发声频率（Hz），由低到高 */
-#define BEEP_FREQ_LEVEL1_HZ   2000u   /* 一级预警：低频间歇 */
-#define BEEP_FREQ_LEVEL2_HZ   3000u   /* 一级警报：中频间歇 */
-#define BEEP_FREQ_LEVEL25_HZ  2500u   /* 2.5档：滴答变调（2.5k 短音交替） */
-#define BEEP_FREQ_LEVEL3_HZ   4000u   /* 二级警报：高频长鸣 */
+/* 各档发声频率（Hz）——按四级预警分档命名（2026-08-29） */
+#define BEEP_FREQ_LOW_HZ    2000u   /* 低音：三级滴答变调的交替低音 */
+#define BEEP_FREQ_LVL2_HZ   3000u   /* 二级预警：3kHz 间歇 */
+#define BEEP_FREQ_LVL3A_HZ  2500u   /* 三级预警：滴答变调的主音（与低音交替） */
+#define BEEP_FREQ_LVL4_HZ   4000u   /* 四级警报：4kHz 长鸣 */
 
 /**
  * @brief  蜂鸣器初始化：PD12 配为 AF2(TIM4_CH1)，PWM 模式2+CCR=0（静默=常高），

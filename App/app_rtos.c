@@ -7,8 +7,9 @@
  *            TaskDecision Normal       512字  20ms  状态机+三级预警决策
  *            TaskMotor    AboveNormal  256字  10ms  TB6612 电机控制
  *            TaskBt       Normal       512字  事件  蓝牙指令解析
- *            TaskK230     Normal       512字  事件  K230 协议解析
- *            TaskDisplay  Low          512字  50ms  LED/蜂鸣器/OLED
+ *            TaskK230     Normal       512字  事件  K230 视觉行协议解析
+ *            TaskRadar    Normal       512字  事件  LD2450 雷达目标帧解析
+ *            TaskDisplay  Low          512字  50ms  LED/蜂鸣器/OLED（含开机版本横幅）
  *          CubeMX 中已删除 defaultTask，所有任务由本文件统一创建。
  ******************************************************************************
  */
@@ -19,7 +20,6 @@ SensorData_t g_sensor;
 Decision_t   g_decision;
 
 osMessageQueueId_t q_bt_cmd   = NULL;
-osMessageQueueId_t q_k230_cmd = NULL;
 
 /* ============================ 任务句柄与属性 ============================ */
 osThreadId_t t_sensor   = NULL;
@@ -62,7 +62,9 @@ void App_Init(void)
     g_sensor.fusion_valid  = 0;
     g_sensor.update_tick   = 0;
 
-    g_decision.mode          = MODE_NORMAL;  /* 上电默认：普通避障模式 */
+    /* 2026-08-29：上电默认遥控模式3，初始静止不动；
+     * 按按键1/2 或发 MA/MB 才进入自主避障模式（自主模式自动巡航前进）。 */
+    g_decision.mode          = MODE_BLUETOOTH;
     g_decision.alert_level   = ALERT_NONE;
     g_decision.target_speed_l = 0;
     g_decision.target_speed_r = 0;
@@ -70,7 +72,7 @@ void App_Init(void)
 
     /* ---------- 指令队列 ---------- */
     q_bt_cmd   = osMessageQueueNew(8, sizeof(AppCmd_t), NULL);  /* 蓝牙指令，深度8 */
-    q_k230_cmd = osMessageQueueNew(8, sizeof(AppCmd_t), NULL);  /* K230 指令，深度8 */
+    /* 2026-08-29：原 q_k230_cmd 队列从未使用（K230 视觉直写 g_sensor），已删除 */
 
     /* ---------- 创建任务 ---------- */
     const osThreadAttr_t attr_sensor = {

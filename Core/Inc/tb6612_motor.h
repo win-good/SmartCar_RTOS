@@ -19,8 +19,9 @@
  *   1) 先把 MOTOR_SPEED_CRUISE_PCT 调到车能平稳直走的最低值再+10 余量；
  *   2) 直行跑偏用 MOTOR_TRIM_L/R_PCT 配平（偏左=左轮慢→加大 L 或减小 R）；
  *   3) 倒车/转弯档位按手感微调。 */
-#define MOTOR_SPEED_SLOW_PCT    35   /* 后退 / 一级预警减速直行 */
-#define MOTOR_SPEED_CRUISE_PCT  50   /* 巡航直行速度 */
+#define MOTOR_SPEED_SLOW_PCT    40   /* 后退/减速/脱困低速档；2026-08-29 由35提至40（低于启动阈值部分电机不转） */
+#define MOTOR_SPEED_CRUISE_PCT  50   /* 巡航直行速度（蓝牙遥控 W 档沿用） */
+/* 2026-08-29：原 MOTOR_SPEED_CREEP_PCT 慢速档已删除（三模式直行统一为巡航档，低于启动阈值电机不转） */
 #define MOTOR_SPEED_TURN_PCT    40   /* 避障转向差速 */
 #define MOTOR_SPEED_UTURN_PCT   45   /* 死胡同掉头速度 */
 #define MOTOR_TRIM_L_PCT         0   /* 左轮配平补偿：正=左轮加速 */

@@ -223,7 +223,7 @@ void Error_Handler(void)
   /* USER CODE BEGIN Error_Handler_Debug */
   /* User can add his own implementation to report the HAL error return state */
   /* 2026-08-24：不再 __disable_irq()+死循环（那样只能断电恢复）。
-   * 保持中断开启原地等待，由独立看门狗(约2.7s)自动复位整机恢复。 */
+   * 保持中断开启原地等待，由独立看门狗(超时20s)自动复位整机恢复。 */
   while (1)
   {
   }

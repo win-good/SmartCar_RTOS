@@ -1,14 +1,14 @@
 /**
  ******************************************************************************
  * @file    app_tasks.c
- * @brief   毕设智能小车 FreeRTOS 任务框架 —— 六个任务的实现
+ * @brief   毕设智能小车 FreeRTOS 任务框架 —— 七个任务的实现
  *
  * 【2026-08-28 四级预警定稿】（高级覆盖低级，声光显示互斥只显最高级）：
  *   一级预警 ：前超声波<1m 或 视觉识别到目标(人体/车辆) 或 雷达目标(0.5m,2m]
  *              → 减速；【绿灯，蜂鸣器静音】
  *   二级预警 ：前超声波<30cm 或 左/右/后超声波<20cm 或 雷达距离≤0.5m
  *              （雷达+视觉共同确认也走此档）→ 转向避让；黄灯；3kHz 50ms 间歇
- *   三级预警 ：任一红外触发(左≈10cm/右≈1cm) → 黄灯(与二级共用)；
+ *   三级预警 ：任一红外触发(左/右电位器均调至约10cm) → 黄灯(与二级共用)；
  *              2.5kHz 滴答变调(频率/间歇与二级不同)；自动转向/死胡同掉头
  *   四级警报 ：任一超声波<3cm 或 烟雾/酒精超阈值 → 红灯 + 4kHz 长鸣 +
  *              任何模式速度强制清零
@@ -19,8 +19,10 @@
  *          先判 d<=DIST_VALID_MAX_CM，避免把无效值当 0cm 误触发四级。
  *
  * 蓝牙协议（JDY-31，USART1 9600，手机串口助手发送字符串；2026-08-24 增强）：
- *   "MA"=切模式1 → 回 "[OK] Mode1 Normal"   "MB"=切模式2 → 回 "[OK] Mode2 Fusion"
- *   "MC"=切模式3 → 回 "[OK] Mode3 Remote"   "TH"=查询温湿度 → 回 "T:26C H:55%"
+ *   "MA"=切模式1 → 回 "[OK] Mode1 Normal"（切过去自动巡航前进）
+ *   "MB"=切模式2 → 回 "[OK] Mode2 Fusion"（切过去自动巡航前进）
+ *   "MC"=切模式3 → 回 "[OK] Mode3 Remote"（切过去立即停止静止）
+ *   "TH"=查询温湿度 → 回 "T:26C H:55%"     "GAS"=查询气体/酒精 → 回 "MQ2:512 MQ3:480 OK"
  *   "W"=前进→回"[OK] FWD"  "S"=后退→回"[OK] BACK"  "A"=左转→回"[OK] LEFT"
  *   "D"=右转→回"[OK] RIGHT" "U"=掉头→回"[OK] UTURN" "X"=停止→回"[OK] STOP"
  *   未识别指令 → 回 "[ERR] Unknown:xxx"（附带收到的原文便于排查）。
@@ -32,7 +34,7 @@
  *   按键1=模式1 / 按键2=模式2 / 按键3=模式3，与蓝牙 MA/MB/MC 等效；
  *   消抖用"按下锁定 + 三键全松解锁"，长按不会连切。
  *
- * 可靠性（2026-08-24 新增）：TaskDisplay 每帧喂独立看门狗(约2.7s)并做 OLED
+ * 可靠性（2026-08-24 新增）：TaskDisplay 每帧喂独立看门狗(20s 超时)并做 OLED
  *   I2C 自检（总线卡死自动恢复+重初始化），死机/花屏均可自愈。
  *
  * 直行保持：MPU6050 航向积分，直线段偏航 >3° 时差速修正 TB6612。
@@ -59,9 +61,19 @@
 #define TH_WARN_CM          100u  /* 一级：前超声波 <1m → 减速             */
 #define TH_ALARM_CM         30u   /* 二级：前超声波 <30cm → 转向避让        */
 #define TH_SIDE_CM          20u   /* 二级：左/右/后超声波 <20cm → 转向避让  */
-#define TH_CRITICAL_CM       3u   /* 四级：任一超声波 <3cm → 强制制动       */
-/* 三级由红外二值触发（硬件电位器定距：左≈10cm / 右≈1cm），无软件阈值 */
+#define TH_CRITICAL_CM       5u   /* 四级：任一超声波(含后) <5cm → 强制制动（2026-08-30 用户改3→5） */
+/* 三级由红外二值触发（硬件电位器定距：左右均约10cm），无软件阈值 */
 #define TH_DEADEND_CM       20u   /* 死胡同判定：左/右/后均 <20cm → 掉头   */
+/* 三级由红外二值触发（左右电位器均调至约 10cm），无软件阈值——上一行旧注释已删 */
+
+/* 行为调试时间宏（2026-08-29 引出，单位 ms；侧向修偏已改为条件式，无需时间宏） */
+#define IR_TURN_HOLD_MS     400u  /* 红外触发反向转向后，即使红外已清除也至少
+                                   * 保持转向这么久再恢复直行——避免"一解除就
+                                   * 回直"导致贴着障碍物/墙壁走 */
+/* 侧向修正改为 0.242 版"条件式即时修偏"（无时间状态机），对应宏已删除 */
+#define IR_TURN_MAX_MS      1500u /* 单次红外反向转向的最长时间（硬上限）：即使
+                                   * 红外一直触发，到点也强制恢复直行——防止卡角
+                                   * 时原地自转四五秒出不来 */
 
 /* 雷达/视觉参数（2026-08-28 启用） */
 #define TH_RADAR_LVL1_CM    200u  /* 一级：雷达目标 ∈ (0.5m,2m]              */
@@ -78,7 +90,7 @@
 /* 速度档（2026-08-28 统一归入 tb6612_motor.h「电机调试宏区」集中调参）：
  * 实车调速/配平只需改 tb6612_motor.h 里的 MOTOR_*_PCT，重编译即可。 */
 #define SPEED_SLOW          MOTOR_SPEED_SLOW_PCT
-#define SPEED_CRUISE        MOTOR_SPEED_CRUISE_PCT
+#define SPEED_CRUISE        MOTOR_SPEED_CRUISE_PCT   /* 三模式直行统一档位（2026-08-29） */
 #define SPEED_TURN          MOTOR_SPEED_TURN_PCT
 #define SPEED_UTURN         MOTOR_SPEED_UTURN_PCT
 
@@ -158,12 +170,18 @@ static uint8_t DistNear(uint16_t d, uint16_t th)
 /**
  * @brief  四级预警计算（2026-08-28 定稿，只返回当前最高级，显示层互斥）
  *   四级：任一超声波<3cm 或 气体超标 → 红灯长鸣+强制制动
- *   三级：任一红外触发（左≈10cm/右≈1cm）→ 黄灯滴答+自动转向
+ *   三级：任一红外触发（左右均约10cm）→ 黄灯滴答+自动转向
  *   二级：前超声波<30cm 或 左/右/后<20cm 或 雷达≤0.5m → 转向避让
  *   一级：前超声波<1m 或 视觉识别到目标 或 雷达目标∈(0.5m,2m] → 减速
  */
-static uint8_t CalcAlertLevel(const SensorData_t *s)
+static uint8_t CalcAlertLevel(const SensorData_t *s, uint8_t moving)
 {
+    /* 2026-08-29：静止状态超声波/红外/雷达/视觉一律不参与预警（方便调试）；
+     * 气体超标独立于运动状态，静止时仍报四级（安全项）。 */
+    if (!moving) {
+        return (uint8_t)(((s->mq2_ok == 0u) || (s->mq3_ok == 0u)) ? ALERT_LEVEL4 : ALERT_NONE);
+    }
+
     /* --- 四级警报：任一超声波 <3cm 或 烟雾/酒精超阈值 --- */
     if (DistNear(s->dist_front_cm, TH_CRITICAL_CM) ||
         DistNear(s->dist_left_cm,  TH_CRITICAL_CM) ||
@@ -204,44 +222,46 @@ static uint8_t CalcAlertLevel(const SensorData_t *s)
 
 /* ============================ 运动规划 ============================ */
 /**
- * @brief  通用"对比左右超声波转向"（二级与三级共用）
- * @note   侧向无效值(0xFFFF)按"开放"处理，避免单侧传感器失联导致误倒车。
+ * @brief  轻微修偏：以 base 速度直行，同时向更宽一侧差速修正（±10）
+ * @note   2026-08-29 回退至上一代行为：前/侧超声波过近时只做小幅修正，
+ *         不再原地差速转圈（旧版会一直转到前方脱离阈值，实测转圈时间过长）。
+ *         真正的"原地转向"统一交给红外触发（见决策任务三级逻辑）。
+ *         侧向无效值(0xFFFF)视为最远，优先避开失联侧。
  */
-static void PlanTurnBySide(const SensorData_t *s, Decision_t *out)
+static void PlanVeer(const SensorData_t *s, Decision_t *out, int16_t base)
 {
-    uint16_t dl = s->dist_left_cm, dr = s->dist_right_cm;
-    uint8_t open_l = (dl > TH_ALARM_CM) || (dl > DIST_VALID_MAX_CM);
-    uint8_t open_r = (dr > TH_ALARM_CM) || (dr > DIST_VALID_MAX_CM);
-
-    if (open_r && !open_l)      { out->target_speed_l =  SPEED_TURN; out->target_speed_r = -SPEED_TURN; }
-    else if (open_l && !open_r) { out->target_speed_l = -SPEED_TURN; out->target_speed_r =  SPEED_TURN; }
-    else if (open_l && open_r)  {
-        /* 两侧都开：向更宽一侧差速转（无效值视为最远，优先避开失联侧） */
-        uint16_t dlc = (dl > DIST_VALID_MAX_CM) ? 0xFFFFu : dl;
-        uint16_t drc = (dr > DIST_VALID_MAX_CM) ? 0xFFFFu : dr;
-        if (drc >= dlc) { out->target_speed_l = SPEED_TURN; out->target_speed_r = SPEED_SLOW; }
-        else            { out->target_speed_l = SPEED_SLOW; out->target_speed_r = SPEED_TURN; }
-    } else                      { out->target_speed_l = -SPEED_SLOW; out->target_speed_r = -SPEED_SLOW; }
+    uint16_t dlc = (s->dist_left_cm  > DIST_VALID_MAX_CM) ? 0xFFFFu : s->dist_left_cm;
+    uint16_t drc = (s->dist_right_cm > DIST_VALID_MAX_CM) ? 0xFFFFu : s->dist_right_cm;
+    if (drc >= dlc) {   /* 右侧更宽 → 左轮快右轮慢，向右偏 */
+        out->target_speed_l = (int16_t)(base + 10);
+        out->target_speed_r = (int16_t)(base - 10);
+    } else {            /* 左侧更宽 → 右轮快左轮慢，向左偏 */
+        out->target_speed_l = (int16_t)(base - 10);
+        out->target_speed_r = (int16_t)(base + 10);
+    }
 }
 
-/**
- * @brief  三级自动转向：依托四路超声波选向；左/右/后全堵=死胡同→掉头
- */
-static void PlanLevel3(const SensorData_t *s, Decision_t *out)
+/* ---------- 侧向超声波"条件式即时修偏"（2026-08-30 移植自 0.242 版，实测符合预期） ----------
+ * 语义：仅当"某一侧过近(<TH_SIDE_CM)且对侧确实更宽"时差速修偏；
+ *       一旦左侧距离恢复到范围外，条件不成立 → 本函数立即不生效，
+ *       调用方继续走直行分支——"出了范围就恢复直线"，无需任何时间状态机。
+ * 与旧脉冲状态机的区别：旧版 v1/v2 都在时间窗口上做文章，实测仍画大圆；
+ * 0.242 版直接按瞬时条件输出，行为直观、无残留状态。 */
+static void ApplySideVeer(const SensorData_t *s, Decision_t *out)
 {
-    uint16_t dl = s->dist_left_cm, dr = s->dist_right_cm, db = s->dist_back_cm;
-    uint8_t open_l = (dl > TH_DEADEND_CM) || (dl > DIST_VALID_MAX_CM);
-    uint8_t open_r = (dr > TH_DEADEND_CM) || (dr > DIST_VALID_MAX_CM);
-    uint8_t blk_b  = (db <= TH_DEADEND_CM);   /* 后方无效(0xFFFF)不算堵 */
-
-    if (!open_l && !open_r && blk_b) {
-        /* 死胡同：原地 180° 掉头（差速旋转，靠时间完成半圈；
-         * 简单可靠做法：原地旋转 1.2s，由决策层进入后持续执行） */
-        out->target_speed_l =  SPEED_UTURN;
-        out->target_speed_r = -SPEED_UTURN;
+    /* 左侧过近且右比左宽 → 右偏 */
+    if ((s->dist_left_cm <= TH_SIDE_CM) && (s->dist_right_cm > s->dist_left_cm)) {
+        out->target_speed_l = (int16_t)(SPEED_CRUISE + 10);
+        out->target_speed_r = (int16_t)(SPEED_CRUISE - 10);
         return;
     }
-    PlanTurnBySide(s, out);
+    /* 右侧过近且左比右宽 → 左偏 */
+    if ((s->dist_right_cm <= TH_SIDE_CM) && (s->dist_left_cm > s->dist_right_cm)) {
+        out->target_speed_l = (int16_t)(SPEED_CRUISE - 10);
+        out->target_speed_r = (int16_t)(SPEED_CRUISE + 10);
+        return;
+    }
+    /* 不满足条件：什么都不做，直行速度由后续分支写入 */
 }
 
 /**
@@ -249,7 +269,14 @@ static void PlanLevel3(const SensorData_t *s, Decision_t *out)
  */
 static void ApplyYawCorrection(int16_t base, Decision_t *out)
 {
-    if (!g_sensor.mpu_ok) return;
+    /* 2026-08-30 修复：MPU 未连接时旧代码直接 return，直行段速度永远=0，
+     * 表现为"切模式1不动、要给超声波刺激（进入分支）才走"。
+     * 现改为：无 MPU 时不修正，但 base 速度必须写入。 */
+    if (!g_sensor.mpu_ok) {
+        out->target_speed_l = base;
+        out->target_speed_r = base;
+        return;
+    }
     int16_t yaw = g_sensor.yaw_deg10;
     if (yaw > YAW_CORRECT_TH_DEG10 || yaw < -YAW_CORRECT_TH_DEG10) {
         int16_t comp = (int16_t)((yaw / 10) * YAW_CORRECT_GAIN);
@@ -271,26 +298,30 @@ static void PlanModeNormal(const SensorData_t *s, Decision_t *out)
 {
     uint16_t df = s->dist_front_cm;
 
-    /* 二级：前 <30cm → 对比左右转向 */
-    if (DistNear(df, TH_ALARM_CM)) { PlanTurnBySide(s, out); return; }
+    /* 死胡同掉头：左/右/后均 <20cm → 原地掉头（2026-08-29 从三级迁至此） */
+    if (DistNear(s->dist_left_cm, TH_DEADEND_CM) &&
+        DistNear(s->dist_right_cm, TH_DEADEND_CM) &&
+        DistNear(s->dist_back_cm,  TH_DEADEND_CM)) {
+        out->target_speed_l =  SPEED_UTURN; out->target_speed_r = -SPEED_UTURN; return;
+    }
 
-    /* 二级联动：左/右侧 <20cm → 向另一侧修偏转向（左近偏右、右近偏左） */
-    if (DistNear(s->dist_left_cm, TH_SIDE_CM)) {
-        out->target_speed_l = SPEED_CRUISE + 10; out->target_speed_r = SPEED_CRUISE - 10; return;
-    }
-    if (DistNear(s->dist_right_cm, TH_SIDE_CM)) {
-        out->target_speed_l = SPEED_CRUISE - 10; out->target_speed_r = SPEED_CRUISE + 10; return;
-    }
+    /* 二级：前 <30cm → 向更宽一侧轻微修偏（2026-08-29 回退：不再原地转圈，
+     * 原地转向统一由红外触发，见决策任务三级逻辑） */
+    if (DistNear(df, TH_ALARM_CM)) { PlanVeer(s, out, SPEED_CRUISE); return; }
+
+    /* 二级联动：左/右侧 <20cm → 条件式即时修偏（2026-08-30 移植 0.242：
+     * 出范围立即恢复直线；不 return，直行速度照常写入） */
+    ApplySideVeer(s, out);
 
     /* 一级：前 <1m → 减速直行（带航向修正） */
     if (DistNear(df, TH_WARN_CM)) { ApplyYawCorrection(SPEED_SLOW, out); return; }
 
-    /* 后方联动：后 <20cm → 禁止倒车（低速直行拉开距离，倒车保护） */
+    /* 后方联动：后 <20cm → 禁止倒车（巡航直行拉开距离，倒车保护） */
     if (DistNear(s->dist_back_cm, TH_SIDE_CM)) {
-        ApplyYawCorrection(SPEED_SLOW, out); return;
+        ApplyYawCorrection(SPEED_CRUISE, out); return;
     }
 
-    /* 巡航直行（带航向修正） */
+    /* 2026-08-29 修订：三模式直行速度统一为遥控巡航档（低速档低于部分电机启动阈值） */
     ApplyYawCorrection(SPEED_CRUISE, out);
 }
 
@@ -300,7 +331,7 @@ static void PlanModeNormal(const SensorData_t *s, Decision_t *out)
 static void PlanModeFusion(const SensorData_t *s, Decision_t *out)
 {
     if (s->fusion_valid) {
-        if (s->fusion_dist_cm <= TH_ALARM_CM)       { PlanTurnBySide(s, out); return; }
+        if (s->fusion_dist_cm <= TH_ALARM_CM)       { PlanVeer(s, out, SPEED_CRUISE); return; }
         if (s->fusion_dist_cm <= TH_RADAR_LVL1_CM)  { ApplyYawCorrection(SPEED_SLOW, out); return; } /* (0.3m,2m] 减速 */
     }
     PlanModeNormal(s, out);
@@ -331,7 +362,7 @@ void TaskSensor_Start(void *argument)
         read_idx = trig_idx;
         trig_idx = (uint8_t)((trig_idx + 1u) % HCSR04_NUM);
 
-        /* 3. 红外（左=2.5级探测器 右=3级探测器） */
+        /* 3. 红外（三级探测器：左右电位器均调至约10cm，0=有障碍） */
         g_sensor.ir_left  = Infrared_Read(IR_LEFT);
         g_sensor.ir_right = Infrared_Read(IR_RIGHT);
 
@@ -405,7 +436,29 @@ void TaskDecision_Start(void *argument)
     (void)argument;
     AppCmd_t cmd;
     SensorData_t snap;
-    uint8_t warm_cycles = 0;
+    uint32_t warm_cycles = 0;      /* 预热计数（2026-08-29 修复：uint8→uint32，
+                                    * 防计数回绕导致电机每 5s 周期性卡顿） */
+    uint8_t prev_moving = 0u;      /* 上一周期运动标志（预警静止屏蔽用） */
+    /* --- 红外反向转向状态机（2026-08-29 v2，修复"自转四五秒"缺陷）---
+     * v1 缺陷：转向途中左右红外交替触发会中途换向来回摆，转不完；
+     * v2 行为：只认触发侧红外、转向中忽略对侧（防换向），
+     *          且单次转向有 IR_TURN_MAX_MS 硬上限（卡角也不会一直自转）。
+     * ir_st：0=直行  1=右转向(左触发)  2=左转向(右触发) */
+    uint8_t  ir_st        = 0u;
+    uint32_t ir_turn_tk   = 0u;    /* 本次转向开始的 tick（保持窗口与硬上限共用） */
+    uint8_t  ir_both      = 0u;    /* 双触发后退脱困状态（保持到两侧都清空） */
+    uint8_t  ir_esc_side  = 0u;    /* 卡角逃逸时的原触发侧（1=左 2=右） */
+    /* 模式切换语义宏：自主模式(1/2)=自动巡航前进；模式3(遥控)=立即停止静止。
+     * 切换时完整复位转向/修偏状态机与航向基准，杜绝"上一模式残留状态带进新模式"。 */
+    #define ENTER_AUTO_MODE(m) do { g_decision.mode = (m); g_decision.rc_active = 0u; \
+        g_decision.rc_speed_l = 0; g_decision.rc_speed_r = 0; \
+        ir_st = 0u; ir_both = 0u; ir_esc_side = 0u; \
+        MPU6050_ResetYaw(); } while (0)
+    #define ENTER_REMOTE_MODE() do { g_decision.mode = MODE_BLUETOOTH; g_decision.rc_active = 0u; \
+        g_decision.rc_speed_l = 0; g_decision.rc_speed_r = 0; \
+        g_decision.target_speed_l = 0; g_decision.target_speed_r = 0; \
+        ir_st = 0u; ir_both = 0u; ir_esc_side = 0u; \
+        MPU6050_ResetYaw(); } while (0)
 
     for (;;) {
         /* ---------- 0. 模式按键（PD0/PD1/PD2，2026-08-24 新增） ----------
@@ -419,9 +472,9 @@ void TaskDecision_Start(void *argument)
             uint8_t k3 = (HAL_GPIO_ReadPin(KEY_MODE3_GPIO_Port, KEY_MODE3_Pin) == GPIO_PIN_RESET) ? 1u : 0u;
             if ((k1 || k2 || k3) && !key_lock) {
                 key_lock = 1u;   /* 锁定，防长按连切 */
-                if      (k1) { g_decision.mode = MODE_NORMAL;    MPU6050_ResetYaw(); }
-                else if (k2) { g_decision.mode = MODE_FUSION;    MPU6050_ResetYaw(); }
-                else if (k3) { g_decision.mode = MODE_BLUETOOTH; MPU6050_ResetYaw(); }
+                if      (k1) { ENTER_AUTO_MODE(MODE_NORMAL);  }   /* 按键1 → 模式1：自动前进 */
+                else if (k2) { ENTER_AUTO_MODE(MODE_FUSION);  }   /* 按键2 → 模式2：自动前进 */
+                else if (k3) { ENTER_REMOTE_MODE();           }   /* 按键3 → 模式3：停止静止 */
             } else if (!(k1 || k2 || k3)) {
                 key_lock = 0u;   /* 全松解锁，允许下次按键触发 */
             }
@@ -432,13 +485,12 @@ void TaskDecision_Start(void *argument)
             /* 2026-08-24：TaskBt 对"非模式3下发的遥控指令"置 arg[0]=1，
              * 此处自动切入模式3 再执行，保证手机端"发W车就走"，与回传文本一致 */
             if ((cmd.arg[0] == 1) && (g_decision.mode != MODE_BLUETOOTH)) {
-                g_decision.mode = MODE_BLUETOOTH;
-                MPU6050_ResetYaw();
+                ENTER_REMOTE_MODE();   /* 遥控指令跨模式下发 → 先切模式3（随后该指令立即执行） */
             }
             switch (cmd.cmd) {
-                case BT_CMD_MODE1: g_decision.mode = MODE_NORMAL;   MPU6050_ResetYaw(); break;
-                case BT_CMD_MODE2: g_decision.mode = MODE_FUSION;   MPU6050_ResetYaw(); break;
-                case BT_CMD_MODE3: g_decision.mode = MODE_BLUETOOTH; MPU6050_ResetYaw(); break;
+                case BT_CMD_MODE1: ENTER_AUTO_MODE(MODE_NORMAL); break;  /* 切模式1 → 自动前进 */
+                case BT_CMD_MODE2: ENTER_AUTO_MODE(MODE_FUSION); break;  /* 切模式2 → 自动前进 */
+                case BT_CMD_MODE3: ENTER_REMOTE_MODE();          break;  /* 切模式3 → 停止静止 */
                 case BT_CMD_FWD:   g_decision.rc_speed_l =  SPEED_CRUISE; g_decision.rc_speed_r =  SPEED_CRUISE; g_decision.rc_active = 1; break;
                 case BT_CMD_BACK:  g_decision.rc_speed_l = -SPEED_SLOW;  g_decision.rc_speed_r = -SPEED_SLOW;  g_decision.rc_active = 1; break;
                 case BT_CMD_TURNL: g_decision.rc_speed_l = -SPEED_TURN; g_decision.rc_speed_r =  SPEED_TURN; g_decision.rc_active = 1; break;
@@ -451,11 +503,10 @@ void TaskDecision_Start(void *argument)
                 default: break;   /* TH 查询在 TaskBt 内直接回传，不入队列 */
             }
         }
+        /* 说明：K230 视觉识别结果由 TaskK230 直写 g_sensor，不经过队列，
+         * 2026-08-29 已删除此处原废弃队列(q_k230_cmd)的空转代码。 */
 
-        /* ---------- 2. K230 视觉消息（识别结果已由 TaskK230 直写 g_sensor，此处空转保持兼容） ---------- */
-        while (osMessageQueueGet(q_k230_cmd, &cmd, NULL, 0) == osOK) { }
-
-        /* ---------- 3. 快照 + 新鲜度管理 + 分级（互斥：只保留最高级） ---------- */
+        /* ---------- 2. 快照 + 新鲜度管理 + 分级（互斥：只保留最高级） ---------- */
         snap = g_sensor;
         {
             uint32_t now_tk = osKernelGetTickCount();
@@ -474,7 +525,9 @@ void TaskDecision_Start(void *argument)
             g_sensor.fusion_dist_cm = snap.fusion_dist_cm;   /* 同步回全局供显示层 */
             g_sensor.fusion_valid   = snap.fusion_valid;
         }
-        g_decision.alert_level = CalcAlertLevel(&snap);
+        /* 2026-08-29：用"上一周期是否运动"做预警屏蔽依据，
+         * 保证静止→运动的第一个周期传感器就已参与 */
+        g_decision.alert_level = CalcAlertLevel(&snap, prev_moving);
 
         /* 模式2 融合叠加（只升不降） */
         if ((g_decision.mode == MODE_FUSION) && (snap.fusion_valid)) {
@@ -497,9 +550,84 @@ void TaskDecision_Start(void *argument)
         default: g_decision.mode = MODE_NORMAL; break;
         }
 
-        /* ---------- 5. 三级：红外触发自动转向/死胡同掉头（覆盖当前规划） ---------- */
-        if (g_decision.alert_level == ALERT_LEVEL3) {
-            PlanLevel3(&snap, &g_decision);
+        /* ---------- 5. 红外反向转向状态机（2026-08-29 v2：防换向 + 硬上限 + 卡角逃逸） ----------
+         * 基本行为：运动中左红外触发→原地右转，右红外触发→原地左转；
+         *          双触发→后退脱困（退到两侧都清空为止）；死胡同→原地掉头。
+         * v1 缺陷：转向途中左右红外交替触发会中途换向、来回摆动永远转不完，
+         *          红外一直触发时无时间上限 → 原地自转四五秒。
+         * v2 修复：
+         *   (1) 转向中锁定方向：只看触发侧红外是否清除，忽略对侧（防换向）；
+         *   (2) 红外清除后仍保持转向 IR_TURN_HOLD_MS（防贴墙）才恢复直行；
+         *   (3) 红外一直触发超过 IR_TURN_MAX_MS → 进入卡角逃逸：直行并忽略该侧
+         *       红外直到它清除（前方碰撞由超声波侧偏/四级制动兜底）；
+         *   (4) 静止状态整体复位，不干扰调试。
+         * ir_st：0=直行  1=右转(左触发)  2=左转(右触发)  3=卡角逃逸直行 */
+        {
+            uint8_t il = (snap.ir_left  == 0u) ? 1u : 0u;   /* 1=左红外有障碍 */
+            uint8_t ir = (snap.ir_right == 0u) ? 1u : 0u;   /* 1=右红外有障碍 */
+            uint8_t cur_moving = (g_decision.target_speed_l != 0) || (g_decision.target_speed_r != 0);
+
+            if (!cur_moving) {
+                /* 静止：转向状态机整体复位（调试免打扰） */
+                ir_st = 0u; ir_both = 0u; ir_esc_side = 0u;
+            } else if (ir_both) {
+                /* 双触发后退脱困中：保持后退直到两侧红外都清空 */
+                if (!(il && ir)) ir_both = 0u;      /* 已脱困 → 下一周期重新检测 */
+                else {
+                    g_decision.target_speed_l = -SPEED_SLOW;
+                    g_decision.target_speed_r = -SPEED_SLOW;
+                }
+            } else if (ir_st == 3u) {
+                /* 卡角逃逸：直行，忽略原触发侧红外，该侧清除后恢复检测 */
+                uint8_t side_gone = (ir_esc_side == 1u) ? (il == 0u) : (ir == 0u);
+                if (side_gone) { ir_st = 0u; ir_esc_side = 0u; }
+            } else if (ir_st != 0u) {
+                /* 转向中：只看触发侧是否清除，忽略对侧触发（防换向摆动） */
+                uint8_t  still = (ir_st == 1u) ? il : ir;
+                uint32_t tk = osKernelGetTickCount();
+                if (still) {
+                    /* 触发侧仍有障碍：未超硬上限继续转，超了进入卡角逃逸 */
+                    if ((tk - ir_turn_tk) >= IR_TURN_MAX_MS) {
+                        ir_esc_side = ir_st;        /* 记住是哪侧触发的 */
+                        ir_st = 3u;                 /* 强制直行逃逸 */
+                    }
+                } else {
+                    /* 触发侧已清除：保持窗口内继续转，窗口到期恢复直行（防贴墙） */
+                    if ((tk - ir_turn_tk) >= IR_TURN_HOLD_MS) ir_st = 0u;
+                }
+            } else if (il && ir) {
+                /* 新双触发：前方贴死 → 后退脱困 */
+                ir_both = 1u;
+                g_decision.target_speed_l = -SPEED_SLOW;
+                g_decision.target_speed_r = -SPEED_SLOW;
+            } else if (il) {
+                ir_st = 1u; ir_turn_tk = osKernelGetTickCount();   /* 左触发 → 原地右转 */
+            } else if (ir) {
+                ir_st = 2u; ir_turn_tk = osKernelGetTickCount();   /* 右触发 → 原地左转 */
+            }
+
+            /* 转向速度输出（ir_st=1/2 时覆盖模式规划的直行速度） */
+            if (ir_st == 1u) {                                   /* 原地右转 */
+                g_decision.target_speed_l =  SPEED_TURN;
+                g_decision.target_speed_r = -SPEED_TURN;
+            } else if (ir_st == 2u) {                            /* 原地左转 */
+                g_decision.target_speed_l = -SPEED_TURN;
+                g_decision.target_speed_r =  SPEED_TURN;
+            }
+
+            /* 死胡同：运动中左/右/后均 <20cm → 原地掉头（最高优先，覆盖红外转向） */
+            if (cur_moving &&
+                DistNear(snap.dist_left_cm,  TH_DEADEND_CM) &&
+                DistNear(snap.dist_right_cm, TH_DEADEND_CM) &&
+                DistNear(snap.dist_back_cm,  TH_DEADEND_CM)) {
+                g_decision.target_speed_l =  SPEED_UTURN;
+                g_decision.target_speed_r = -SPEED_UTURN;
+            }
+
+            /* ---------- 5.1 moving 标志同步（静止屏蔽用） ---------- */
+            cur_moving = (g_decision.target_speed_l != 0) || (g_decision.target_speed_r != 0);
+            g_decision.moving = cur_moving;
+            prev_moving = cur_moving;
         }
 
         /* ---------- 6. 四级警报：任何模式（含蓝牙遥控）强制清零 ---------- */
@@ -511,7 +639,7 @@ void TaskDecision_Start(void *argument)
         /* ---------- 7. 预热保护 ---------- */
         uint32_t now = osKernelGetTickCount();
         uint8_t fresh = (g_sensor.update_tick != 0u) && ((now - g_sensor.update_tick) < 100u);
-        warm_cycles = fresh ? (uint8_t)(warm_cycles + 1u) : 0u;
+        warm_cycles = fresh ? (warm_cycles + 1u) : 0u;   /* uint32，无回绕风险 */
         g_decision.motor_enabled = (warm_cycles >= 4u) ? 1u : 0u;
 
         osDelay(20);
@@ -608,6 +736,18 @@ void TaskBt_Start(void *argument)
                     char rep[24];
                     int n = snprintf(rep, sizeof(rep), "T:%dC H:%u%%\r\n",
                                      g_sensor.temp_c, g_sensor.humi_pct);
+                    HAL_UART_Transmit(&huart1, (uint8_t *)rep, (uint16_t)n, 80);
+                }
+                else if (strcmp(line, "GAS") == 0) {
+                    /* 2026-08-29 气体/酒精状态查询：与 TH 同构，直接回传不入队列。
+                     * 回传 "MQ2:xxx MQ3:xxx OK/ALARM"——数值为 ADC 原始值，
+                     * OK=两者均在阈值内，ALARM=任一超标（与四级预警判定一致） */
+                    uint16_t m2 = GasSensor_GetMQ2(), m3 = GasSensor_GetMQ3();
+                    char rep[40];
+                    int n = snprintf(rep, sizeof(rep), "MQ2:%u MQ3:%u %s\r\n",
+                                     m2, m3,
+                                     ((m2 >= GAS_MQ2_THRESHOLD) || (m3 >= GAS_MQ3_THRESHOLD))
+                                         ? "ALARM" : "OK");
                     HAL_UART_Transmit(&huart1, (uint8_t *)rep, (uint16_t)n, 80);
                 }
                 else { hit = 0u; Bt_Send("[ERR] Unknown\r\n"); }
@@ -761,9 +901,23 @@ static void OLED_ShowDistCm(int16_t x, int16_t y, uint16_t dist_cm)
 void TaskDisplay_Start(void *argument)
 {
     (void)argument;
+
+    /* --- 开机版本横幅（2026-08-29 新增）：上电先显示 2 秒固件版本号，
+     * 一眼确认板内是否最新固件，杜绝"改了代码没重新烧录"导致的误判。
+     * 版本号约定：FW_Vx.y——每次烧录给用户的固件在此处递增。 */
+    #define FW_VERSION_STR "FW V3.2"
+    OLED_Clear();
+    OLED_ShowString(0, 8,  "SmartCar",  OLED_8X16);
+    OLED_ShowString(0, 24, FW_VERSION_STR, OLED_8X16);
+    OLED_ShowString(0, 40, "2026-08-30", OLED_6X8);
+    OLED_Update();
+    osDelay(2000);
+    #undef FW_VERSION_STR
+
     for (;;) {
-        /* 2026-08-24 可靠性双保险（本任务 50ms 周期，是唯一稳定慢节奏任务）：
-         *  1) 喂独立看门狗：任何任务死锁/跑飞导致本任务停摆，约2.7s后整机自动复位；
+        /* 可靠性双保险（本任务 50ms 周期，是唯一稳定慢节奏任务）：
+         *  1) 喂独立看门狗（20s 超时，见 app_rtos.c 注释）：任何任务死锁/跑飞
+         *     导致本任务停摆，看门狗自动整机复位；
          *  2) OLED I2C 自检：I2C2 卡 BUSY 或 SDA 被拉死时自动恢复总线并重初始化，
          *     花屏/黑屏一帧内自愈，不再累积错位乱码。 */
         App_Watchdog_Feed();
@@ -788,17 +942,17 @@ void TaskDisplay_Start(void *argument)
                 Beep_Off();
                 break;
             case ALERT_LEVEL2:   /* 二级：3kHz，50ms 响 / 50ms 停 */
-                if (tick_cnt & 0x01u) Beep_SetFreq(BEEP_FREQ_LEVEL2_HZ); else Beep_Off();
+                if (tick_cnt & 0x01u) Beep_SetFreq(BEEP_FREQ_LVL2_HZ); else Beep_Off();
                 break;
             case ALERT_LEVEL3:   /* 三级：滴答变调，2.5k 与 2k 交替短音（间歇节奏与二级不同） */
                 if (tick_cnt & 0x04u) {
-                    Beep_SetFreq((tick_cnt & 0x02u) ? BEEP_FREQ_LEVEL25_HZ : BEEP_FREQ_LEVEL1_HZ);
+                    Beep_SetFreq((tick_cnt & 0x02u) ? BEEP_FREQ_LVL3A_HZ : BEEP_FREQ_LOW_HZ);
                 } else {
                     Beep_Off();
                 }
                 break;
             case ALERT_LEVEL4:   /* 四级：4kHz 长鸣 */
-                Beep_SetFreq(BEEP_FREQ_LEVEL3_HZ);
+                Beep_SetFreq(BEEP_FREQ_LVL4_HZ);
                 break;
             default:
                 Beep_Off();
@@ -842,18 +996,19 @@ void TaskDisplay_Start(void *argument)
         {
             char l3[20];
             l3[0] = '\0';
-            if (DistNear(g_sensor.dist_front_cm, TH_WARN_CM) || g_sensor.vis_target_seen ||
-                (g_sensor.radar_present && (g_sensor.radar_dist_cm <= TH_RADAR_LVL1_CM))) strcat(l3, "1 ");
-            if (DistNear(g_sensor.dist_front_cm, TH_ALARM_CM) ||
+            uint8_t mv = g_decision.moving;  /* 2026-08-29：静止不显示触发源（气体四级除外） */
+            if (mv && (DistNear(g_sensor.dist_front_cm, TH_WARN_CM) || g_sensor.vis_target_seen ||
+                (g_sensor.radar_present && (g_sensor.radar_dist_cm <= TH_RADAR_LVL1_CM)))) strcat(l3, "1 ");
+            if (mv && (DistNear(g_sensor.dist_front_cm, TH_ALARM_CM) ||
                 DistNear(g_sensor.dist_left_cm,  TH_SIDE_CM)  ||
                 DistNear(g_sensor.dist_right_cm, TH_SIDE_CM)  ||
                 DistNear(g_sensor.dist_back_cm,  TH_SIDE_CM)  ||
-                (g_sensor.radar_present && (g_sensor.radar_dist_cm <= TH_RADAR_LVL2_CM))) strcat(l3, "2 ");
-            if ((g_sensor.ir_left == 0u) || (g_sensor.ir_right == 0u)) strcat(l3, "3 ");
-            if (DistNear(g_sensor.dist_front_cm, TH_CRITICAL_CM) ||
+                (g_sensor.radar_present && (g_sensor.radar_dist_cm <= TH_RADAR_LVL2_CM)))) strcat(l3, "2 ");
+            if (mv && ((g_sensor.ir_left == 0u) || (g_sensor.ir_right == 0u))) strcat(l3, "3 ");
+            if ((mv && (DistNear(g_sensor.dist_front_cm, TH_CRITICAL_CM) ||
                 DistNear(g_sensor.dist_left_cm,  TH_CRITICAL_CM) ||
                 DistNear(g_sensor.dist_right_cm, TH_CRITICAL_CM) ||
-                DistNear(g_sensor.dist_back_cm,  TH_CRITICAL_CM) ||
+                DistNear(g_sensor.dist_back_cm,  TH_CRITICAL_CM))) ||
                 (g_sensor.mq2_ok == 0u) || (g_sensor.mq3_ok == 0u)) strcat(l3, "4 ");
             snprintf(buf, sizeof(buf), "ALARM:%-13s", (l3[0] ? l3 : "--"));
             OLED_ShowString(0, 48, "                     ", OLED_6X8);
