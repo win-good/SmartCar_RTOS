@@ -4,9 +4,9 @@
  * @brief   毕设智能小车 FreeRTOS 任务框架 —— 七个任务的实现
  *
  * 【2026-08-28 四级预警定稿】（高级覆盖低级，声光显示互斥只显最高级）：
- *   一级预警 ：前超声波<1m 或 视觉识别到目标(人体/车辆) 或 雷达目标(0.5m,2m]
+ *   一级预警 ：前超声波<1m 或 视觉识别到目标(人体/车辆) 或 雷达目标(1.5m,3m]
  *              → 减速；【绿灯，蜂鸣器静音】
- *   二级预警 ：前超声波<30cm 或 左/右/后超声波<20cm 或 雷达距离≤0.5m
+ *   二级预警 ：前超声波<30cm 或 左/右/后超声波<20cm 或 雷达距离≤1.5m
  *              （雷达+视觉共同确认也走此档）→ 转向避让；黄灯；3kHz 50ms 间歇
  *   三级预警 ：任一红外触发(左/右电位器均调至约10cm) → 黄灯(与二级共用)；
  *              2.5kHz 滴答变调(频率/间歇与二级不同)；自动转向/死胡同掉头
@@ -14,7 +14,7 @@
  *              任何模式速度强制清零
  * 职责划分：四路超声波全部联动——前=1/2/4级，左/右/后=2级(<20cm)/4级(<3cm)，
  *          并参与转向选向与死胡同掉头；红外只反馈三级；
- *          雷达/视觉=一级与二级（视觉目标或雷达(0.5,2m]→一级；雷达≤0.5m→二级）。
+ *          雷达/视觉=一级与二级（视觉目标或雷达(1.5m,3m]→一级；雷达≤1.5m→二级）。
  * 距离"无效值"约定：HC-SR04 超量程/无回波返回 0xFFFF，凡参与分级比较必须
  *          先判 d<=DIST_VALID_MAX_CM，避免把无效值当 0cm 误触发四级。
  *
@@ -61,7 +61,7 @@
 #define TH_WARN_CM          100u  /* 一级：前超声波 <1m → 减速             */
 #define TH_ALARM_CM         30u   /* 二级：前超声波 <30cm → 转向避让        */
 #define TH_SIDE_CM          20u   /* 二级：左/右/后超声波 <20cm → 转向避让  */
-#define TH_CRITICAL_CM       5u   /* 四级：任一超声波(含后) <5cm → 强制制动（2026-08-30 用户改3→5） */
+#define TH_CRITICAL_CM       3u   /* 四级：任一超声波(含后) <3cm → 强制制动 */
 /* 三级由红外二值触发（硬件电位器定距：左右均约10cm），无软件阈值 */
 #define TH_DEADEND_CM       20u   /* 死胡同判定：左/右/后均 <20cm → 掉头   */
 /* 三级由红外二值触发（左右电位器均调至约 10cm），无软件阈值——上一行旧注释已删 */
@@ -76,8 +76,8 @@
                                    * 时原地自转四五秒出不来 */
 
 /* 雷达/视觉参数（2026-08-28 启用） */
-#define TH_RADAR_LVL1_CM    200u  /* 一级：雷达目标 ∈ (0.5m,2m]              */
-#define TH_RADAR_LVL2_CM     50u  /* 二级：雷达距离 ≤0.5m（含雷达+视觉确认） */
+#define TH_RADAR_LVL1_CM    300u  /* 一级：雷达目标 ∈ (1.5m,3m]              */
+#define TH_RADAR_LVL2_CM    150u  /* 二级：雷达距离 ≤1.5m（含雷达+视觉确认） */
 #define RADAR_MAX_CM        600u  /* LD2450 量程约 6m，超此值视为无效        */
 #define RADAR_TIMEOUT_MS    800u  /* 超过该时长无雷达上报 → 目标视为离开     */
 #define VIS_TIMEOUT_MS      800u  /* 视觉目标记忆时长（目标走出画面后渐消）   */
@@ -171,8 +171,8 @@ static uint8_t DistNear(uint16_t d, uint16_t th)
  * @brief  四级预警计算（2026-08-28 定稿，只返回当前最高级，显示层互斥）
  *   四级：任一超声波<3cm 或 气体超标 → 红灯长鸣+强制制动
  *   三级：任一红外触发（左右均约10cm）→ 黄灯滴答+自动转向
- *   二级：前超声波<30cm 或 左/右/后<20cm 或 雷达≤0.5m → 转向避让
- *   一级：前超声波<1m 或 视觉识别到目标 或 雷达目标∈(0.5m,2m] → 减速
+ *   二级：前超声波<30cm 或 左/右/后<20cm 或 雷达≤1.5m → 转向避让
+ *   一级：前超声波<1m 或 视觉识别到目标 或 雷达目标∈(1.5m,3m] → 减速
  */
 static uint8_t CalcAlertLevel(const SensorData_t *s, uint8_t moving)
 {
@@ -196,7 +196,7 @@ static uint8_t CalcAlertLevel(const SensorData_t *s, uint8_t moving)
         return ALERT_LEVEL3;
     }
 
-    /* --- 二级：前<30cm / 侧、后<20cm / 雷达≤0.5m（雷达+视觉共同确认同档） --- */
+    /* --- 二级：前<30cm / 侧、后<20cm / 雷达≤1.5m（雷达+视觉共同确认同档） --- */
     if (DistNear(s->dist_front_cm, TH_ALARM_CM) ||
         DistNear(s->dist_left_cm,  TH_SIDE_CM) ||
         DistNear(s->dist_right_cm, TH_SIDE_CM) ||
@@ -207,7 +207,7 @@ static uint8_t CalcAlertLevel(const SensorData_t *s, uint8_t moving)
         return ALERT_LEVEL2;
     }
 
-    /* --- 一级：前<1m / 视觉目标 / 雷达∈(0.5m,2m] --- */
+    /* --- 一级：前<1m / 视觉目标 / 雷达∈(1.5m,3m] --- */
     if (DistNear(s->dist_front_cm, TH_WARN_CM)) {
         return ALERT_LEVEL1;
     }
@@ -226,12 +226,14 @@ static uint8_t CalcAlertLevel(const SensorData_t *s, uint8_t moving)
  * @note   2026-08-29 回退至上一代行为：前/侧超声波过近时只做小幅修正，
  *         不再原地差速转圈（旧版会一直转到前方脱离阈值，实测转圈时间过长）。
  *         真正的"原地转向"统一交给红外触发（见决策任务三级逻辑）。
- *         侧向无效值(0xFFFF)视为最远，优先避开失联侧。
+ *         2026-08-30 修复：无效值(0xFFFF=无回波)改视为"最近"——旧逻辑把
+ *         无效当最远，贴墙一侧读不到回波反被判为"该侧最宽"，车朝墙侧
+ *         偏航直接撞墙（实测：右侧贴墙→往右偏）。现主动避开失联侧。
  */
 static void PlanVeer(const SensorData_t *s, Decision_t *out, int16_t base)
 {
-    uint16_t dlc = (s->dist_left_cm  > DIST_VALID_MAX_CM) ? 0xFFFFu : s->dist_left_cm;
-    uint16_t drc = (s->dist_right_cm > DIST_VALID_MAX_CM) ? 0xFFFFu : s->dist_right_cm;
+    uint16_t dlc = (s->dist_left_cm  > DIST_VALID_MAX_CM) ? 0u : s->dist_left_cm;
+    uint16_t drc = (s->dist_right_cm > DIST_VALID_MAX_CM) ? 0u : s->dist_right_cm;
     if (drc >= dlc) {   /* 右侧更宽 → 左轮快右轮慢，向右偏 */
         out->target_speed_l = (int16_t)(base + 10);
         out->target_speed_r = (int16_t)(base - 10);
@@ -243,25 +245,31 @@ static void PlanVeer(const SensorData_t *s, Decision_t *out, int16_t base)
 
 /* ---------- 侧向超声波"条件式即时修偏"（2026-08-30 移植自 0.242 版，实测符合预期） ----------
  * 语义：仅当"某一侧过近(<TH_SIDE_CM)且对侧确实更宽"时差速修偏；
- *       一旦左侧距离恢复到范围外，条件不成立 → 本函数立即不生效，
- *       调用方继续走直行分支——"出了范围就恢复直线"，无需任何时间状态机。
- * 与旧脉冲状态机的区别：旧版 v1/v2 都在时间窗口上做文章，实测仍画大圆；
- * 0.242 版直接按瞬时条件输出，行为直观、无残留状态。 */
-static void ApplySideVeer(const SensorData_t *s, Decision_t *out)
+ *       一旦该侧距离恢复到范围外，条件不成立 → 调用方走直行分支——
+ *       "出了范围就恢复直线"，无需任何时间状态机。
+ * 返回值：1=已写入偏航速度（调用方应 return 防止被直行覆盖）；0=未修偏。
+ * 2026-08-30 修复两处：①调用点漏 return 导致偏航被覆盖（修偏从未生效）；
+ *               ②无效值 0xFFFF 改视为"最近"，贴墙失联侧主动避开、不再朝墙偏。 */
+static uint8_t ApplySideVeer(const SensorData_t *s, Decision_t *out)
 {
+    /* 无效值(0xFFFF)视为"最近"：贴墙侧读不到回波时主动避开（与 PlanVeer 一致，2026-08-30） */
+    uint16_t dl = (s->dist_left_cm  > DIST_VALID_MAX_CM) ? 0u : s->dist_left_cm;
+    uint16_t dr = (s->dist_right_cm > DIST_VALID_MAX_CM) ? 0u : s->dist_right_cm;
+
     /* 左侧过近且右比左宽 → 右偏 */
-    if ((s->dist_left_cm <= TH_SIDE_CM) && (s->dist_right_cm > s->dist_left_cm)) {
+    if ((dl <= TH_SIDE_CM) && (dr > dl)) {
         out->target_speed_l = (int16_t)(SPEED_CRUISE + 10);
         out->target_speed_r = (int16_t)(SPEED_CRUISE - 10);
-        return;
+        return 1;
     }
     /* 右侧过近且左比右宽 → 左偏 */
-    if ((s->dist_right_cm <= TH_SIDE_CM) && (s->dist_left_cm > s->dist_right_cm)) {
+    if ((dr <= TH_SIDE_CM) && (dl > dr)) {
         out->target_speed_l = (int16_t)(SPEED_CRUISE - 10);
         out->target_speed_r = (int16_t)(SPEED_CRUISE + 10);
-        return;
+        return 1;
     }
     /* 不满足条件：什么都不做，直行速度由后续分支写入 */
+    return 0;
 }
 
 /**
@@ -309,9 +317,10 @@ static void PlanModeNormal(const SensorData_t *s, Decision_t *out)
      * 原地转向统一由红外触发，见决策任务三级逻辑） */
     if (DistNear(df, TH_ALARM_CM)) { PlanVeer(s, out, SPEED_CRUISE); return; }
 
-    /* 二级联动：左/右侧 <20cm → 条件式即时修偏（2026-08-30 移植 0.242：
-     * 出范围立即恢复直线；不 return，直行速度照常写入） */
-    ApplySideVeer(s, out);
+    /* 二级联动：左/右侧 <20cm → 条件式即时修偏（2026-08-30 移植 0.242）。
+     * 命中后必须 return：否则后续直行分支会把偏航速度覆盖掉（旧 BUG）；
+     * 出范围后条件不成立，自动恢复直行分支。 */
+    if (ApplySideVeer(s, out)) return;
 
     /* 一级：前 <1m → 减速直行（带航向修正） */
     if (DistNear(df, TH_WARN_CM)) { ApplyYawCorrection(SPEED_SLOW, out); return; }
@@ -332,7 +341,7 @@ static void PlanModeFusion(const SensorData_t *s, Decision_t *out)
 {
     if (s->fusion_valid) {
         if (s->fusion_dist_cm <= TH_ALARM_CM)       { PlanVeer(s, out, SPEED_CRUISE); return; }
-        if (s->fusion_dist_cm <= TH_RADAR_LVL1_CM)  { ApplyYawCorrection(SPEED_SLOW, out); return; } /* (0.3m,2m] 减速 */
+        if (s->fusion_dist_cm <= TH_RADAR_LVL1_CM)  { ApplyYawCorrection(SPEED_SLOW, out); return; } /* (0.3m,3m] 减速 */
     }
     PlanModeNormal(s, out);
 }
@@ -636,9 +645,14 @@ void TaskDecision_Start(void *argument)
             g_decision.target_speed_r = 0;
         }
 
-        /* ---------- 7. 预热保护 ---------- */
+        /* ---------- 7. 预热保护 ----------
+         * 2026-09-03 修复"全模式不转+微弱嗡鸣"根因：超声波改同帧同步轮询后
+         * （4 路×30ms 回波窗口），传感任务周期约 150~200ms，旧 100ms 新鲜度
+         * 窗口几乎永远超时 → motor_enabled 恒 0 → 电机任务一直短路制动
+         * （轮子锁死不转、绕组持续通电发出微弱嗡鸣）。放宽到 500ms：仍远小于
+         * "传感器停摆"的判定间隔，预热保护本意（上电初几帧不信任）不受影响。 */
         uint32_t now = osKernelGetTickCount();
-        uint8_t fresh = (g_sensor.update_tick != 0u) && ((now - g_sensor.update_tick) < 100u);
+        uint8_t fresh = (g_sensor.update_tick != 0u) && ((now - g_sensor.update_tick) < 500u);
         warm_cycles = fresh ? (warm_cycles + 1u) : 0u;   /* uint32，无回绕风险 */
         g_decision.motor_enabled = (warm_cycles >= 4u) ? 1u : 0u;
 
@@ -653,10 +667,13 @@ void TaskMotor_Start(void *argument)
     for (;;) {
         if (g_decision.motor_enabled) {
             /* 2026-08-28：左右轮配平补偿（MOTOR_TRIM_L/R_PCT），
-             * 抵消四只电机启动阈值/摩擦不一致导致的直行跑偏；
-             * 仅在行驶速度上叠加，±100 限幅。 */
-            int16_t tl = (int16_t)(g_decision.target_speed_l + MOTOR_TRIM_L_PCT);
-            int16_t tr = (int16_t)(g_decision.target_speed_r + MOTOR_TRIM_R_PCT);
+             * 抵消四只电机启动阈值/摩擦不一致导致的直行跑偏。
+             * 2026-09-03 修正：配平只叠加在"行驶中"的轮子上——零速轮保持 0，
+             * 否则停车时配平值（如右+2）会让该轮带微弱驱动/嗡嗡响。 */
+            int16_t tl = g_decision.target_speed_l;
+            int16_t tr = g_decision.target_speed_r;
+            if (tl != 0) tl = (int16_t)(tl + MOTOR_TRIM_L_PCT);
+            if (tr != 0) tr = (int16_t)(tr + MOTOR_TRIM_R_PCT);
             if (tl >  100) tl =  100;
             if (tl < -100) tl = -100;
             if (tr >  100) tr =  100;
@@ -823,7 +840,7 @@ void TaskK230_Start(void *argument)
  *   每个目标 8 字节：X坐标(2B,有符号,-240~240cm) | Y坐标(2B,0~600cm,正前方距离)
  *                   | 速度(2B,有符号,±127cm/s)   | 距离分辨率(2B,mm)
  *   X=Y=速度=分辨率全0 = 空目标（无有效目标），跳过。
- * 作用：取最近目标距离 radar_dist_cm；≤0.5m→二级，(0.5,2]m→一级；
+ * 作用：取最近目标距离 radar_dist_cm；≤1.5m→二级，(1.5,3]m→一级；
  *       超过 RADAR_TIMEOUT_MS 无新帧视为目标离开（决策层清零）。 */
 typedef enum {
     RD_WAIT_55 = 0, RD_WAIT_AA, RD_WAIT_03, RD_LEN_LO, RD_LEN_HI, RD_DATA, RD_TAIL_55, RD_TAIL_CC
@@ -905,11 +922,11 @@ void TaskDisplay_Start(void *argument)
     /* --- 开机版本横幅（2026-08-29 新增）：上电先显示 2 秒固件版本号，
      * 一眼确认板内是否最新固件，杜绝"改了代码没重新烧录"导致的误判。
      * 版本号约定：FW_Vx.y——每次烧录给用户的固件在此处递增。 */
-    #define FW_VERSION_STR "FW V3.2"
+    #define FW_VERSION_STR "FW V3.5"
     OLED_Clear();
     OLED_ShowString(0, 8,  "SmartCar",  OLED_8X16);
     OLED_ShowString(0, 24, FW_VERSION_STR, OLED_8X16);
-    OLED_ShowString(0, 40, "2026-08-30", OLED_6X8);
+    OLED_ShowString(0, 40, "2026-09-03", OLED_6X8);
     OLED_Update();
     osDelay(2000);
     #undef FW_VERSION_STR
