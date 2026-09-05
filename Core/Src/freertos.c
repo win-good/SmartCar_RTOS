@@ -132,5 +132,28 @@ void MX_FREERTOS_Init(void) {
 /* Private application code --------------------------------------------------*/
 /* USER CODE BEGIN Application */
 
+/* ============================ 任务栈溢出钩子（2026-09-05 改为非冻结） ============================
+ * 上一版(09-04)钩子里用 taskDISABLE_INTERRUPTS()+死循环"冻结现场"，
+ * 结果一旦触发整机停摆：电机停在短路制动态(嗡鸣不转)、OLED 定格、
+ * TaskDisplay 没机会运行（承诺的 OVF 显示永远打不出来），只能等看门狗复位。
+ * 现改为【非冻结】：仅记录任务名并置位，立即返回让系统继续跑；
+ * 由 TaskDisplay 在 OLED 上打印 "OVF:<任务名>" 并蜂鸣提示，方便定位。
+ * 注意：当前 FreeRTOSConfig.h 中 configCHECK_FOR_STACK_OVERFLOW=0（检测关闭），
+ *       本钩子不会被调用，仅作为将来重新开启检测时的安全实现保留。
+ * 约束：钩子运行在中断禁止上下文，禁止调用 RTOS API 与阻塞函数。 */
+volatile char g_stack_overflow_task[16] = "";   /* 溢出的任务名（空串=未溢出） */
+
+void vApplicationStackOverflowHook(TaskHandle_t xTask, char *pcTaskName)
+{
+    (void)xTask;
+    /* 记录任务名（手动拷贝，不依赖字符串库） */
+    for (uint8_t i = 0u; i < 15u; i++) {
+        g_stack_overflow_task[i] = pcTaskName[i];
+        if (pcTaskName[i] == '\0') break;
+    }
+    g_stack_overflow_task[15] = '\0';
+    /* 直接返回，不冻结系统；故障提示交给 TaskDisplay 显示 */
+}
+
 /* USER CODE END Application */
 

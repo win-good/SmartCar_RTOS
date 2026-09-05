@@ -74,33 +74,43 @@ void App_Init(void)
     q_bt_cmd   = osMessageQueueNew(8, sizeof(AppCmd_t), NULL);  /* 蓝牙指令，深度8 */
     /* 2026-08-29：原 q_k230_cmd 队列从未使用（K230 视觉直写 g_sensor），已删除 */
 
-    /* ---------- 创建任务 ---------- */
+    /* ---------- 创建任务 ----------
+     * 2026-09-05：各任务栈防御性加大（原 512字/电机256字偏紧）。
+     * 堆余量充足（20KB 堆，原总占用约 12.5KB），加大后仍有余量；
+     * 目的：即使某任务存在临界栈使用也不会溢出，彻底排除"栈溢出→异常"这一类
+     * 难以定位的故障源。电机任务栈翻倍到 512字，与其余任务一致。 */
     const osThreadAttr_t attr_sensor = {
-        .name = "TaskSensor", .stack_size = 512 * 4,
+        .name = "TaskSensor", .stack_size = 1024 * 4,
         .priority = (osPriority_t)osPriorityAboveNormal,
     };
     t_sensor = osThreadNew(TaskSensor_Start, NULL, &attr_sensor);
 
     const osThreadAttr_t attr_decision = {
-        .name = "TaskDecision", .stack_size = 512 * 4,
+        .name = "TaskDecision", .stack_size = 1024 * 4,
         .priority = (osPriority_t)osPriorityNormal,
     };
     t_decision = osThreadNew(TaskDecision_Start, NULL, &attr_decision);
 
     const osThreadAttr_t attr_motor = {
-        .name = "TaskMotor", .stack_size = 256 * 4,
-        .priority = (osPriority_t)osPriorityAboveNormal,
+        .name = "TaskMotor", .stack_size = 512 * 4,
+        /* 2026-09-05：优先级 AboveNormal → High。
+         * 电机输出属硬实时，必须高于"忙等超声波回波"的传感任务：
+         * TaskSensor 每周期同步轮询 4 路、最长忙等约 140ms 不让出 CPU，
+         * 且原与电机同为 AboveNormal——同优先级下电机刷新会被长时间推迟，
+         * 表现为占空比更新不及时（电机嗡鸣/爬行）。提到 High 后电机
+         * 10ms 刷新不再受传感任务忙等影响。 */
+        .priority = (osPriority_t)osPriorityHigh,
     };
     t_motor = osThreadNew(TaskMotor_Start, NULL, &attr_motor);
 
     const osThreadAttr_t attr_bt = {
-        .name = "TaskBt", .stack_size = 512 * 4,
+        .name = "TaskBt", .stack_size = 1024 * 4,
         .priority = (osPriority_t)osPriorityNormal,
     };
     t_bt = osThreadNew(TaskBt_Start, NULL, &attr_bt);
 
     const osThreadAttr_t attr_k230 = {
-        .name = "TaskK230", .stack_size = 512 * 4,
+        .name = "TaskK230", .stack_size = 1024 * 4,
         .priority = (osPriority_t)osPriorityNormal,
     };
     t_k230 = osThreadNew(TaskK230_Start, NULL, &attr_k230);
@@ -109,13 +119,13 @@ void App_Init(void)
      * USART6 256000 中断接收 → 解析目标帧 → 写 g_sensor.radar_*；
      * 雷达数据只参与预警分级与模式2融合，不直接驱动电机。 */
     const osThreadAttr_t attr_radar = {
-        .name = "TaskRadar", .stack_size = 512 * 4,
+        .name = "TaskRadar", .stack_size = 1024 * 4,
         .priority = (osPriority_t)osPriorityNormal,
     };
     t_radar = osThreadNew(TaskRadar_Start, NULL, &attr_radar);
 
     const osThreadAttr_t attr_display = {
-        .name = "TaskDisplay", .stack_size = 512 * 4,
+        .name = "TaskDisplay", .stack_size = 1024 * 4,
         .priority = (osPriority_t)osPriorityLow,
     };
     t_display = osThreadNew(TaskDisplay_Start, NULL, &attr_display);

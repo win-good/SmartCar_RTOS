@@ -177,6 +177,13 @@ static void OLED_I2C_Send(uint8_t *Buf, uint16_t Len)
   */
 void OLED_I2C_SelfCheck(void)
 {
+	/* 2026-09-05 新增【限频】：自救+重初始化最多每 2 秒做一次。
+	 * 原缺陷：若 SDA 持续读到低电平（屏未插好/外部上拉缺失/接线松动时 PB11
+	 * 作为开漏 AF 会浮空读低），本函数会在【每一帧】都判定异常 →
+	 * 每帧执行 BusRecovery + OLED_Init（内含 HAL_Delay(100) 与整屏重绘），
+	 * 表现为 OLED 持续闪烁，且 TaskDisplay 每帧被白白阻塞 100ms 以上。
+	 * 限频后：真故障仍能在 2 秒内自愈，误判时不再刷屏闪烁。 */
+	static uint32_t s_last_fix_tick = 0u;
 	uint8_t need_reinit = 0u;
 
 	if ((hi2c2.State != HAL_I2C_STATE_READY) && (hi2c2.State != HAL_I2C_STATE_BUSY_TX))
@@ -188,8 +195,11 @@ void OLED_I2C_SelfCheck(void)
 		need_reinit = 1u;		/*空闲时 SDA 应为高：被拉低=从机卡死*/
 	}
 
-	if (need_reinit)
+	/*HAL_GetTick 在调度器启动前后都可用（SysTick 由 HAL_Init 起就递增），
+	  故此处不用 osKernelGetTickCount，避免 OLED_Init 阶段调用出错*/
+	if (need_reinit && ((HAL_GetTick() - s_last_fix_tick) >= 2000u))
 	{
+		s_last_fix_tick = HAL_GetTick();
 		OLED_I2C_BusRecovery();	/*恢复总线+重置外设*/
 		OLED_Init();			/*重发完整初始化序列并清屏，屏幕自愈*/
 	}

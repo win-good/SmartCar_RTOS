@@ -68,7 +68,10 @@
 #define configTICK_RATE_HZ                       ((TickType_t)1000)
 #define configMAX_PRIORITIES                     ( 56 )
 #define configMINIMAL_STACK_SIZE                 ((uint16_t)128)
-#define configTOTAL_HEAP_SIZE                    ((size_t)20480)
+/* 2026-09-05：堆由 20KB 扩到 36KB——各任务栈防御性加大后总需求约 29KB，
+ * 若不改此处，osThreadNew 会因堆不足返回 NULL（任务建不起来，整机异常）。
+ * F407VGT6 有 192KB SRAM，36KB 堆余量充足。 */
+#define configTOTAL_HEAP_SIZE                    ((size_t)36864)
 #define configMAX_TASK_NAME_LEN                  ( 16 )
 #define configUSE_TRACE_FACILITY                 1
 #define configUSE_16_BIT_TICKS                   0
@@ -152,6 +155,12 @@ See http://www.FreeRTOS.org/RTOS-Cortex-M3-M4.html. */
 header file. */
 /* USER CODE BEGIN 1 */
 #define configASSERT( x ) if ((x) == 0) {taskDISABLE_INTERRUPTS(); for( ;; );}
+/* 2026-09-05：栈溢出检测改回关闭（=0，与 0.291N 一致）。
+ * 上次(09-04)开启检测并配了"冻结式"钩子（taskDISABLE_INTERRUPTS+死循环），
+ * 一旦触发就整机冻死：电机停在上电短路制动态(嗡鸣不转)、OLED 定格、
+ * 看门狗 20s 后再复位再冻——正是"电机不转+嗡鸣+OLED 无打印"的根因。
+ * 现关闭检测消除冻结回归；同时下方已防御性加大各任务栈，溢出风险一并消除。 */
+#define configCHECK_FOR_STACK_OVERFLOW 0
 /* USER CODE END 1 */
 
 /* Definitions that map the FreeRTOS port interrupt handlers to their CMSIS

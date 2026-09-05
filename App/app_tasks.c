@@ -76,11 +76,15 @@
                                    * 时原地自转四五秒出不来 */
 
 /* 雷达/视觉参数（2026-08-28 启用） */
-#define TH_RADAR_LVL1_CM    300u  /* 一级：雷达目标 ∈ (1.5m,3m]              */
-#define TH_RADAR_LVL2_CM    150u  /* 二级：雷达距离 ≤1.5m（含雷达+视觉确认） */
+#define TH_RADAR_LVL1_CM    300u  /* 一级：雷达目标 ∈ (0.3m,3m]              */
+#define TH_RADAR_LVL2_CM     30u  /* 二级：雷达距离 ≤0.3m（含雷达+视觉确认） */
 #define RADAR_MAX_CM        600u  /* LD2450 量程约 6m，超此值视为无效        */
 #define RADAR_TIMEOUT_MS    800u  /* 超过该时长无雷达上报 → 目标视为离开     */
 #define VIS_TIMEOUT_MS      800u  /* 视觉目标记忆时长（目标走出画面后渐消）   */
+/* 2026-09-05：静止目标过滤阈值(cm/s)。|速度| 小于此值的目标视为静止
+ * （墙/桌腿/家具等），不参与预警——解决近处静止物误报二级。
+ * 调大=只报明显运动的目标（更抗误报）；调 0=完全不过滤（旧行为）。 */
+#define RADAR_MIN_SPEED_CMS  5u
 
 /* 直行航向修正：偏航超过该值(0.1°)开始差速修正（3° = 30） */
 #define YAW_CORRECT_TH_DEG10  30
@@ -94,6 +98,10 @@
 #define SPEED_TURN          MOTOR_SPEED_TURN_PCT
 #define SPEED_UTURN         MOTOR_SPEED_UTURN_PCT
 
+/* 2026-09-04：栈溢出诊断（定义在 freertos.c 的 vApplicationStackOverflowHook）：
+ * 非空=某任务栈溢出，值为该任务名；显示任务据此打故障横幅。 */
+extern volatile char g_stack_overflow_task[16];
+
 /* ============================ 蓝牙接收（中断字节 → 环形缓冲） ============================ */
 static uint8_t  s_bt_rx_byte;                 /* 中断接收单字节缓冲 */
 static uint8_t  s_bt_ring[64];                /* 环形缓冲 */
@@ -101,7 +109,12 @@ static volatile uint16_t s_bt_rd = 0, s_bt_wr = 0;
 
 /* ============================ 雷达/视觉接收（同为 中断字节→环形缓冲，2026-08-28） ============================ */
 static uint8_t  s_radar_rx_byte;
-static uint8_t  s_radar_ring[160];            /* LD2450 目标帧最长 31 字节，160 足够缓冲多帧 */
+static uint8_t  s_radar_ring[256];            /* 【2026-09-04 修复内存越界】原为[160]，但读写
+                                               * 索引用 &0xFF 在 256 处回绕 → 索引 160~255
+                                               * 越界写坏数组后方的全局变量。LD2450 持续上报，
+                                               * 一接雷达就随机踩内存（电机/决策状态被破坏），
+                                               * 正是"接雷达后嗡鸣不转、复位时好时坏"根因。
+                                               * 环形缓冲尺寸必须=掩码+1 的2的幂，故改 256。 */
 static volatile uint16_t s_radar_rd = 0, s_radar_wr = 0;
 
 static uint8_t  s_k230_rx_byte;
@@ -445,9 +458,8 @@ void TaskDecision_Start(void *argument)
     (void)argument;
     AppCmd_t cmd;
     SensorData_t snap;
-    uint32_t warm_cycles = 0;      /* 预热计数（2026-08-29 修复：uint8→uint32，
-                                    * 防计数回绕导致电机每 5s 周期性卡顿） */
-    uint8_t prev_moving = 0u;      /* 上一周期运动标志（预警静止屏蔽用） */
+    uint8_t warm_cycles = 0;     /* 2026-09-04：改回 0.291N 已验证的"传感新鲜度"使能方案 */
+    uint8_t prev_moving = 0u;    /* 上一周期运动标志（预警静止屏蔽用） */
     /* --- 红外反向转向状态机（2026-08-29 v2，修复"自转四五秒"缺陷）---
      * v1 缺陷：转向途中左右红外交替触发会中途换向来回摆，转不完；
      * v2 行为：只认触发侧红外、转向中忽略对侧（防换向），
@@ -645,16 +657,26 @@ void TaskDecision_Start(void *argument)
             g_decision.target_speed_r = 0;
         }
 
-        /* ---------- 7. 预热保护 ----------
-         * 2026-09-03 修复"全模式不转+微弱嗡鸣"根因：超声波改同帧同步轮询后
-         * （4 路×30ms 回波窗口），传感任务周期约 150~200ms，旧 100ms 新鲜度
-         * 窗口几乎永远超时 → motor_enabled 恒 0 → 电机任务一直短路制动
-         * （轮子锁死不转、绕组持续通电发出微弱嗡鸣）。放宽到 500ms：仍远小于
-         * "传感器停摆"的判定间隔，预热保护本意（上电初几帧不信任）不受影响。 */
-        uint32_t now = osKernelGetTickCount();
-        uint8_t fresh = (g_sensor.update_tick != 0u) && ((now - g_sensor.update_tick) < 500u);
-        warm_cycles = fresh ? (warm_cycles + 1u) : 0u;   /* uint32，无回绕风险 */
-        g_decision.motor_enabled = (warm_cycles >= 4u) ? 1u : 0u;
+        /* ---------- 7. 电机使能（2026-09-05 根因修复：放宽窗口 + 锁存） ----------
+         * 【根因】超声波改同帧同步轮询后，传感任务每周期要忙等约 5~35ms
+         * （等回波，期间不让出 CPU，且其优先级高于决策任务），叠加 20ms osDelay，
+         * 实际采样间隔常达 100ms 上下，与旧新鲜度窗口(100ms)同量级：
+         *   → fresh 经常为假 → warm_cycles 累加不到 4 → motor_enabled 恒 0
+         *   → 电机任务一直走 Stop()=短路制动(IN1=IN2=1+满占空比)
+         *   → 表现正是"轮子锁死不转 + 绕组通电的微弱嗡鸣"，且随回波快慢时好时坏。
+         * 0.291N 同一段逻辑带着同样隐患，只是当时环境回波快、间隔恰好 <100ms 才侥幸使能。
+         * 【修复】① 窗口放宽到 500ms，覆盖真实采样间隔；
+         *         ② 使能改锁存：连续 4 次新鲜后永久使能，不再回退，
+         *            彻底消除"驱动/制动"来回切换。传感任务真停摆(>500ms 无更新)时
+         *            使能不会置位，电机保持制动（安全语义不变）。 */
+        if (!g_decision.motor_enabled) {
+            uint32_t now = osKernelGetTickCount();
+            uint8_t fresh = (g_sensor.update_tick != 0u) && ((now - g_sensor.update_tick) < 500u);
+            warm_cycles = fresh ? (uint8_t)(warm_cycles + 1u) : 0u;
+            if (warm_cycles >= 4u) {
+                g_decision.motor_enabled = 1u;   /* 锁存：使能后不再回退 */
+            }
+        }
 
         osDelay(20);
     }
@@ -794,7 +816,7 @@ void TaskBt_Start(void *argument)
 static void K230_ParseLine(const char *line)
 {
     uint8_t  is_person = (strncmp(line, "PERSON", 6u) == 0);
-    uint8_t  is_car    = (strncmp(line, "CAR", 3u) == 0);
+    uint8_t  is_car    = (strncmp(line, "CAR  ", 3u) == 0);
     uint16_t dist = 0xFFFFu;
 
     if (!is_person && !is_car) return;
@@ -833,18 +855,35 @@ void TaskK230_Start(void *argument)
     }
 }
 
-/* ============================ 任务7：LD2450 毫米波雷达（2026-08-28 实现） ============================
- * 协议：出厂默认"工程模式"，USART6 256000 8N1，持续上报多种帧；
- * 本任务只解析【目标数据帧】：
- *   帧头 0x55 0xAA 0x03 | 数据长度(2B 小端,=8×目标数) | N×8字节目标 | 帧尾 0x55 0xCC
- *   每个目标 8 字节：X坐标(2B,有符号,-240~240cm) | Y坐标(2B,0~600cm,正前方距离)
- *                   | 速度(2B,有符号,±127cm/s)   | 距离分辨率(2B,mm)
- *   X=Y=速度=分辨率全0 = 空目标（无有效目标），跳过。
+/* ============================ 任务7：LD2450 毫米波雷达（2026-08-28 实现，09-04 重写协议） ============================
+ * 协议（官方数据帧，USART6 256000 8N1，持续上报，约 30Hz）：
+ *   帧头 4B = AA FF 03 00
+ *   目标数据 3×8=24B：每目标 X(2B)|Y(2B)|速度(2B)|分辨率(2B)，小端；
+ *     X/Y 最高位为符号位（1=正、0=负），低 7 位为数值（mm）；
+ *   帧尾 2B = 55 CC
+ *   距离 = sqrt(X²+Y²)（X 横向 ±300cm、Y 纵深 0~600cm）。
+ * 2026-09-04 重写根因：旧状态机帧头误为 55 AA 03，永远无法同步 → R 恒 "--"。
  * 作用：取最近目标距离 radar_dist_cm；≤1.5m→二级，(1.5,3]m→一级；
  *       超过 RADAR_TIMEOUT_MS 无新帧视为目标离开（决策层清零）。 */
 typedef enum {
-    RD_WAIT_55 = 0, RD_WAIT_AA, RD_WAIT_03, RD_LEN_LO, RD_LEN_HI, RD_DATA, RD_TAIL_55, RD_TAIL_CC
+    RD_SYNC0 = 0, RD_SYNC1, RD_SYNC2, RD_SYNC3, RD_DATA, RD_TAIL_55, RD_TAIL_CC
 } RadarParseState_t;
+
+/* 坐标解码：高 7 位为幅值(mm)，最高位 1=正、0=负 → 返回有符号 cm */
+static int16_t Radar_DecodeCm(uint8_t lo, uint8_t hi)
+{
+    int16_t mag = (int16_t)((((int16_t)hi & 0x7F) << 8) | (int16_t)lo);
+    return ((hi & 0x80u) != 0u) ? (int16_t)(mag / 10) : (int16_t)(-(mag / 10));
+}
+
+/* 整数平方根（牛顿迭代，n≥0） */
+static uint16_t Radar_Isqrt(int32_t n)
+{
+    if (n <= 0) return 0u;
+    int32_t x = n, y = (x + 1) / 2;
+    while (y < x) { x = y; y = (x + n / x) / 2; }
+    return (uint16_t)x;
+}
 
 static void Radar_ParseTargets(const uint8_t *data, uint16_t len)
 {
@@ -853,14 +892,27 @@ static void Radar_ParseTargets(const uint8_t *data, uint16_t len)
     uint16_t i;
 
     for (i = 0u; (i + 8u) <= len; i = (uint16_t)(i + 8u)) {
-        int16_t  x   = (int16_t)(uint16_t)(data[i] | ((uint16_t)data[i + 1u] << 8));
-        uint16_t y   = (uint16_t)(data[i + 2u] | ((uint16_t)data[i + 3u] << 8));
-        int16_t  v   = (int16_t)(uint16_t)(data[i + 4u] | ((uint16_t)data[i + 5u] << 8));
-        uint16_t res = (uint16_t)(data[i + 6u] | ((uint16_t)data[i + 7u] << 8));
+        int16_t x = Radar_DecodeCm(data[i],      data[i + 1u]);   /* 横向 cm */
+        int16_t y = Radar_DecodeCm(data[i + 2u], data[i + 3u]);   /* 纵深 cm */
+        /* 速度字段：编码方式与坐标相同（高 7 位幅值 + 最高位符号），单位 cm/s。
+         * 2026-09-05 启用：用于过滤静止目标（墙、桌腿、家具等），解决
+         * "模式3 静止时雷达报 30cm，切模式1/2 数值不变直接触发二级误报"。 */
+        int16_t v = Radar_DecodeCm(data[i + 4u], data[i + 5u]);   /* 速度 cm/s */
+        int32_t d2 = (int32_t)x * x + (int32_t)y * y;             /* 最大约 45 万，int32 安全 */
+        uint16_t d = Radar_Isqrt(d2);
 
-        if ((x == 0) && (y == 0u) && (v == 0) && (res == 0u)) continue;  /* 空目标 */
+        if (d == 0u) continue;          /* 空目标（X=Y=0）跳过 */
+
+        /* 静止目标过滤：|速度| 低于阈值视为静止（LD2450 对完全静止目标输出 0），
+         * 不参与预警——静止障碍由四路超声波负责，雷达只负责"运动目标"预警。
+         * 阈值见 RADAR_MIN_SPEED_CMS，调大=更抗误报，调 0=关闭过滤（旧行为）。 */
+        {
+            int16_t av = (v < 0) ? (int16_t)-v : v;
+            if (av < (int16_t)RADAR_MIN_SPEED_CMS) continue;
+        }
+
         has_target = 1u;
-        if (y < min_dist) min_dist = y;   /* 取所有目标中最近的一个 */
+        if (d < min_dist) min_dist = d; /* 取最近目标 */
     }
 
     if (has_target && (min_dist <= RADAR_MAX_CM)) {
@@ -873,9 +925,9 @@ static void Radar_ParseTargets(const uint8_t *data, uint16_t len)
 void TaskRadar_Start(void *argument)
 {
     (void)argument;
-    static uint8_t frame[32];           /* 目标数据最多 3×8=24 字节 */
-    static RadarParseState_t st = RD_WAIT_55;
-    static uint16_t need = 0, got = 0;
+    static uint8_t frame[24];           /* 3 目标 × 8 字节 */
+    static RadarParseState_t st = RD_SYNC0;
+    static uint8_t got = 0u;
 
     HAL_UART_Receive_IT(&huart6, &s_radar_rx_byte, 1);   /* 启动中断接收 */
 
@@ -885,25 +937,21 @@ void TaskRadar_Start(void *argument)
         uint8_t b = (uint8_t)c;
 
         switch (st) {
-        case RD_WAIT_55: if (b == 0x55u) st = RD_WAIT_AA;               break;
-        case RD_WAIT_AA: st = (b == 0xAAu) ? RD_WAIT_03 : ((b == 0x55u) ? RD_WAIT_AA : RD_WAIT_55); break;
-        case RD_WAIT_03: st = (b == 0x03u) ? RD_LEN_LO : ((b == 0x55u) ? RD_WAIT_AA : RD_WAIT_55); break;
-        case RD_LEN_LO:  need = b; st = RD_LEN_HI;                       break;
-        case RD_LEN_HI:
-            need = (uint16_t)(need | ((uint16_t)b << 8));
-            if ((need == 0u) || (need > 24u)) { st = RD_WAIT_55; }        /* 长度非法丢帧 */
-            else { got = 0u; st = RD_DATA; }
-            break;
+        case RD_SYNC0: if (b == 0xAAu) st = RD_SYNC1; break;                 /* 帧头第 1 字节 */
+        case RD_SYNC1: st = (b == 0xFFu) ? RD_SYNC2 : ((b == 0xAAu) ? RD_SYNC1 : RD_SYNC0); break;
+        case RD_SYNC2: st = (b == 0x03u) ? RD_SYNC3 : RD_SYNC0; break;
+        case RD_SYNC3: st = (b == 0x00u) ? RD_DATA   : RD_SYNC0;
+                       if (st == RD_DATA) got = 0u; break;
         case RD_DATA:
             frame[got++] = b;
-            if (got >= need) st = RD_TAIL_55;
+            if (got >= 24u) st = RD_TAIL_55;
             break;
-        case RD_TAIL_55: st = (b == 0x55u) ? RD_TAIL_CC : RD_WAIT_55; break;
+        case RD_TAIL_55: st = (b == 0x55u) ? RD_TAIL_CC : RD_SYNC0; break;
         case RD_TAIL_CC:
-            if (b == 0xCCu) Radar_ParseTargets(frame, need);              /* 帧完整，解析 */
-            st = RD_WAIT_55;
+            if (b == 0xCCu) Radar_ParseTargets(frame, 24u);   /* 帧完整，解析 */
+            st = RD_SYNC0;
             break;
-        default: st = RD_WAIT_55; break;
+        default: st = RD_SYNC0; break;
         }
     }
 }
@@ -919,14 +967,15 @@ void TaskDisplay_Start(void *argument)
 {
     (void)argument;
 
-    /* --- 开机版本横幅（2026-08-29 新增）：上电先显示 2 秒固件版本号，
-     * 一眼确认板内是否最新固件，杜绝"改了代码没重新烧录"导致的误判。
-     * 版本号约定：FW_Vx.y——每次烧录给用户的固件在此处递增。 */
-    #define FW_VERSION_STR "FW V3.5"
+    /* --- 开机版本横幅：上电先显示 2 秒固件版本号，一眼确认板内是否最新固件，
+     * 杜绝"改了代码没重新烧录"导致的误判。版本号约定：FW_Vx.y，每次交付递增。
+     * 2026-09-05：电机不转真因已确认为 LM2596 稳压模块负载不足（供电问题），
+     * 排查期临时加的 RST 复位原因探针已移除，恢复纯净横幅。 */
+    #define FW_VERSION_STR "FW V3.9"
     OLED_Clear();
     OLED_ShowString(0, 8,  "SmartCar",  OLED_8X16);
     OLED_ShowString(0, 24, FW_VERSION_STR, OLED_8X16);
-    OLED_ShowString(0, 40, "2026-09-03", OLED_6X8);
+    OLED_ShowString(0, 40, "2026-09-05", OLED_6X8);
     OLED_Update();
     osDelay(2000);
     #undef FW_VERSION_STR
@@ -939,6 +988,29 @@ void TaskDisplay_Start(void *argument)
          *     花屏/黑屏一帧内自愈，不再累积错位乱码。 */
         App_Watchdog_Feed();
         OLED_I2C_SelfCheck();
+
+        /* 2026-09-04 故障可视：若某任务栈溢出（钩子写入任务名），
+         * 全屏打出 "OVF:<任务名>" 并停在本任务，直观定位哪个任务栈不够。
+         * 正常运行该串为空，不进入此分支。 */
+        if (g_stack_overflow_task[0] != '\0') {
+            char fb[20];
+            snprintf(fb, sizeof(fb), "OVF:%s", g_stack_overflow_task);
+            OLED_Clear();
+            OLED_ShowString(0, 0,  "STACK OVERFLOW", OLED_8X16);
+            OLED_ShowString(0, 24, fb, OLED_8X16);
+            OLED_ShowString(0, 48, "Fix task stack!", OLED_6X8);
+            OLED_Update();
+            while (1) { App_Watchdog_Feed(); osDelay(200); }  /* 停住看现场 */
+        }
+
+        /* 2026-09-04：首帧整屏清一次，擦除开机横幅("SmartCar/FW/日期")残留。
+         * 原缺陷：横幅的 8x16 大字("Car")与日期(".5")落在 F/L、R/B 距离行的
+         * 空白像素上，而距离行只重绘自身字符、不擦空白 → 残影混入（照片红圈处）。
+         * 本循环每帧完整重绘所有行，清一次即永久干净。 */
+        {
+            static uint8_t first_frame = 1u;
+            if (first_frame) { first_frame = 0u; OLED_Clear(); }
+        }
 
         uint8_t lv = g_decision.alert_level;
 
@@ -998,6 +1070,9 @@ void TaskDisplay_Start(void *argument)
         OLED_ShowString(64, 24,"B:", OLED_8X16);  OLED_ShowDistCm(80, 24, g_sensor.dist_back_cm);
 
         {
+            /* 第4行：气体状态 + 雷达距离（Q2/Q3 = MQ-2/MQ-3 是否在阈值内，
+             * R:xx = 雷达最近运动目标距离 cm，R:-- = 无目标）。
+             * 2026-09-05：排查电机问题用的 HB/CCR 诊断探针已移除，恢复纯净显示。 */
             char rstr[8];
             if (g_sensor.radar_present) snprintf(rstr, sizeof(rstr), "%u", (unsigned)g_sensor.radar_dist_cm);
             else                        snprintf(rstr, sizeof(rstr), "--");
